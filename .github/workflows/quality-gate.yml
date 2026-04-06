@@ -8,6 +8,8 @@ jobs:
   quality-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
 
     steps:
       - name: Checkout
@@ -69,9 +71,9 @@ jobs:
         run: platformio run -e esp32dev_board_aux
 
       - name: Branch protection policy check (optional)
-        if: ${{ secrets.GH_ADMIN_TOKEN != '' }}
+        if: ${{ env.GH_ADMIN_TOKEN != '' }}
         env:
           GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+          GH_TOKEN: ${{ env.GH_ADMIN_TOKEN }}
           GH_BRANCH: main
         run: ./scripts/qa/check_branch_protection.sh
