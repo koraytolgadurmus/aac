@@ -4,8 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "[QA] Step 1/6: Flutter analyze"
-flutter analyze app/lib/main.dart
+echo "[QA] Step 1/8: Flutter analyze"
+(
+  cd app
+  flutter pub get
+  flutter analyze lib/main.dart
+)
 
 echo "[QA] Step 2/8: Cloud preflight"
 ./scripts/aws/release-preflight.sh
