@@ -44,7 +44,8 @@ fi
 
 for wf in ".github/workflows/quality-gate.yml" \
           ".github/workflows/release-attestation.yml" \
-          ".github/workflows/cloud-ci.yml"; do
+          ".github/workflows/cloud-ci.yml" \
+          ".github/workflows/release-checklist.yml"; do
   if [[ -f "$wf" ]]; then
     ok "Workflow present: $wf"
   else

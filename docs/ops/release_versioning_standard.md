@@ -22,6 +22,9 @@ Bu repo için sürümleme standardı:
 ## Release Discipline
 
 - `main` branch yalnızca PR ile güncellenir.
+- Release checklist workflow:
+  - `.github/workflows/release-checklist.yml`
+  - `v*` tag push ile otomatik çalışır.
 - Release notları ve artefact doğrulaması:
   - `scripts/production/generate_release_attestation.py`
   - `docs/cloud/release_runbook.md`
