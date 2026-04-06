@@ -17,9 +17,11 @@ SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
 FLUTTER_VER_RE='^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$'
 
 fw_version="$(
-  rg -n '^[[:space:]]*#define[[:space:]]+FW_VERSION[[:space:]]+"[^"]+"' src/main.cpp \
-    | head -n1 \
-    | sed -E 's/.*FW_VERSION[[:space:]]+"([^"]+)".*/\1/'
+  if command -v rg >/dev/null 2>&1; then
+    rg -n '^[[:space:]]*#define[[:space:]]+FW_VERSION[[:space:]]+"[^"]+"' src/main.cpp
+  else
+    grep -nE '^[[:space:]]*#define[[:space:]]+FW_VERSION[[:space:]]+"[^"]+"' src/main.cpp
+  fi | head -n1 | sed -E 's/.*FW_VERSION[[:space:]]+"([^"]+)".*/\1/'
 )"
 [[ -n "$fw_version" ]] || fail "FW_VERSION not found in src/main.cpp"
 if [[ ! "$fw_version" =~ $SEMVER_RE ]]; then
