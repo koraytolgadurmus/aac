@@ -52,10 +52,34 @@ for wf in ".github/workflows/quality-gate.yml" \
   fi
 done
 
+if [[ -f ".github/CODEOWNERS" ]]; then
+  ok "CODEOWNERS present"
+else
+  fail "CODEOWNERS missing (.github/CODEOWNERS)"
+fi
+
+if [[ -f "docs/ops/release_versioning_standard.md" ]]; then
+  ok "Release versioning standard present"
+else
+  fail "Missing docs/ops/release_versioning_standard.md"
+fi
+
+if [[ -f "docs/ops/github_security_standard.md" ]]; then
+  ok "GitHub security standard present"
+else
+  fail "Missing docs/ops/github_security_standard.md"
+fi
+
 if [[ -x "scripts/qa/quality_gate.sh" ]]; then
   ok "Quality gate script is executable"
 else
   warn "Quality gate script is not executable"
+fi
+
+if [[ -x "scripts/qa/version_policy_check.sh" ]]; then
+  ok "Version policy script is executable"
+else
+  fail "Version policy script is not executable"
 fi
 
 if [[ $failures -gt 0 ]]; then

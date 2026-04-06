@@ -49,6 +49,12 @@ jobs:
           AUDIT_FAIL_LEVEL: high
         run: ./scripts/qa/dependency_audit.sh
 
+      - name: Secret scan
+        run: ./scripts/aws/secret-scan.sh
+
+      - name: Version policy check
+        run: ./scripts/qa/version_policy_check.sh
+
       - name: Generate SBOM
         run: python3 scripts/qa/generate_sbom.py
 
