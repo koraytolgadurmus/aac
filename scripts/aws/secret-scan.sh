@@ -31,18 +31,27 @@ PATTERN='BEGIN (EC |RSA |)?PRIVATE KEY|certificateArn|certificateId|ownedBy|gene
 info "Scanning repo-managed bootstrap/cert material for live secrets or account-bound artifacts"
 
 set +e
-MATCHES="$(
-  cd "$ROOT_DIR" &&
-    rg -n "${EXCLUDES[@]}" "$PATTERN" "${SCAN_PATHS[@]}"
-)"
-RG_STATUS=$?
+if command -v rg >/dev/null 2>&1; then
+  MATCHES="$(
+    cd "$ROOT_DIR" &&
+      rg -n "${EXCLUDES[@]}" "$PATTERN" "${SCAN_PATHS[@]}"
+  )"
+  SCAN_STATUS=$?
+else
+  MATCHES="$(
+    cd "$ROOT_DIR" &&
+      grep -RInE "$PATTERN" "${SCAN_PATHS[@]}" \
+        | grep -vE 'certs/AmazonRootCA1\.pem|data/AmazonRootCA1\.pem'
+  )"
+  SCAN_STATUS=$?
+fi
 set -e
 
-if [[ "$RG_STATUS" -gt 1 ]]; then
+if [[ "$SCAN_STATUS" -gt 1 ]]; then
   fail "secret scan errored"
 fi
 
-if [[ "$RG_STATUS" -eq 0 && -n "${MATCHES}" ]]; then
+if [[ "$SCAN_STATUS" -eq 0 && -n "${MATCHES}" ]]; then
   echo "$MATCHES" >&2
   fail "live AWS bootstrap material detected in repo paths above"
 fi

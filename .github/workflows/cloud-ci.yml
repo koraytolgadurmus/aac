@@ -2,13 +2,18 @@ name: Cloud CI
 
 on:
   push:
-    branches:
-      - "**"
   pull_request:
 
 jobs:
   cloud-checks:
     runs-on: ubuntu-latest
+    env:
+      PROD_SECURITY_EVIDENCE_JSON: ${{ secrets.PROD_SECURITY_EVIDENCE_JSON }}
+      PROD_DEVICE_PRIVATE_KEY: ${{ secrets.PROD_DEVICE_PRIVATE_KEY }}
+      CLOUD_SMOKE_API_BASE_URL: ${{ secrets.CLOUD_SMOKE_API_BASE_URL }}
+      CLOUD_SMOKE_ACCESS_TOKEN: ${{ secrets.CLOUD_SMOKE_ACCESS_TOKEN }}
+      CLOUD_SMOKE_DEVICE_ID: ${{ secrets.CLOUD_SMOKE_DEVICE_ID }}
+      CLOUD_SMOKE_CLAIM_SECRET: ${{ secrets.CLOUD_SMOKE_CLAIM_SECRET }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,10 +30,7 @@ jobs:
         run: ./scripts/aws/release-preflight.sh
 
       - name: Run strict production gate (optional)
-        if: ${{ secrets.PROD_SECURITY_EVIDENCE_JSON != '' && secrets.PROD_DEVICE_PRIVATE_KEY != '' }}
-        env:
-          PROD_SECURITY_EVIDENCE_JSON: ${{ secrets.PROD_SECURITY_EVIDENCE_JSON }}
-          PROD_DEVICE_PRIVATE_KEY: ${{ secrets.PROD_DEVICE_PRIVATE_KEY }}
+        if: ${{ env.PROD_SECURITY_EVIDENCE_JSON != '' && env.PROD_DEVICE_PRIVATE_KEY != '' }}
         run: |
           tmpdir="$(mktemp -d)"
           trap 'rm -rf "$tmpdir"' EXIT
@@ -41,11 +43,11 @@ jobs:
             --prod-evidence "$tmpdir/production-evidence.json"
 
       - name: Run cloud smoke via preflight (optional)
-        if: ${{ secrets.CLOUD_SMOKE_API_BASE_URL != '' && secrets.CLOUD_SMOKE_ACCESS_TOKEN != '' }}
+        if: ${{ env.CLOUD_SMOKE_API_BASE_URL != '' && env.CLOUD_SMOKE_ACCESS_TOKEN != '' }}
         env:
-          API_BASE_URL: ${{ secrets.CLOUD_SMOKE_API_BASE_URL }}
-          ACCESS_TOKEN: ${{ secrets.CLOUD_SMOKE_ACCESS_TOKEN }}
-          DEVICE_ID: ${{ secrets.CLOUD_SMOKE_DEVICE_ID }}
-          CLAIM_SECRET: ${{ secrets.CLOUD_SMOKE_CLAIM_SECRET }}
+          API_BASE_URL: ${{ env.CLOUD_SMOKE_API_BASE_URL }}
+          ACCESS_TOKEN: ${{ env.CLOUD_SMOKE_ACCESS_TOKEN }}
+          DEVICE_ID: ${{ env.CLOUD_SMOKE_DEVICE_ID }}
+          CLAIM_SECRET: ${{ env.CLOUD_SMOKE_CLAIM_SECRET }}
           SMOKE_STRICT_DESIRED: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
         run: ./scripts/aws/release-preflight.sh --with-smoke

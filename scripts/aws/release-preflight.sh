@@ -295,6 +295,7 @@ fi
 info "1/6 CDK build"
 (
   cd "${ROOT_DIR}/infra/cdk"
+  npm ci --no-audit --no-fund
   npm run -s build
 )
 pass "CDK build"

@@ -2,14 +2,14 @@ name: Quality Gate
 
 on:
   push:
-    branches:
-      - "**"
   pull_request:
 
 jobs:
   quality-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
 
     steps:
       - name: Checkout
@@ -28,7 +28,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.24.5"
+          flutter-version: "3.35.0"
           channel: stable
           cache: true
 
@@ -39,7 +39,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Flutter analyze
-        run: flutter analyze app/lib/main.dart
+        run: |
+          cd app
+          flutter pub get
+          flutter analyze lib/main.dart
 
       - name: Cloud preflight
         run: ./scripts/aws/release-preflight.sh
@@ -48,6 +51,12 @@ jobs:
         env:
           AUDIT_FAIL_LEVEL: high
         run: ./scripts/qa/dependency_audit.sh
+
+      - name: Secret scan
+        run: ./scripts/aws/secret-scan.sh
+
+      - name: Version policy check
+        run: ./scripts/qa/version_policy_check.sh
 
       - name: Generate SBOM
         run: python3 scripts/qa/generate_sbom.py
@@ -65,9 +74,9 @@ jobs:
         run: platformio run -e esp32dev_board_aux
 
       - name: Branch protection policy check (optional)
-        if: ${{ secrets.GH_ADMIN_TOKEN != '' }}
+        if: ${{ env.GH_ADMIN_TOKEN != '' }}
         env:
           GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+          GH_TOKEN: ${{ env.GH_ADMIN_TOKEN }}
           GH_BRANCH: main
         run: ./scripts/qa/check_branch_protection.sh

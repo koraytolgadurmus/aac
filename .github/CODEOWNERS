@@ -1,0 +1,18 @@
+# Default ownership
+* @koraytolgadurmus
+
+# Firmware core
+/src/ @koraytolgadurmus
+/platformio.ini @koraytolgadurmus
+
+# Mobile app
+/app/ @koraytolgadurmus
+
+# Cloud and infra
+/scripts/aws/ @koraytolgadurmus
+/infra/cdk/ @koraytolgadurmus
+
+# Security and operations
+/SECURITY.md @koraytolgadurmus
+/docs/ops/ @koraytolgadurmus
+/scripts/qa/ @koraytolgadurmus
