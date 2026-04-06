@@ -1,0 +1,26 @@
+.hero-video-layer {
+  pointer-events: none;
+  overflow: hidden;
+  transition: opacity 0.3s ease-in-out;
+
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.hero-video-frame {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%) translateZ(0);
+
+  /* "Cover" behavior for iframe content (object-fit doesn't reliably apply to iframes) */
+  width: 100vw;
+  height: calc(100vw * 9 / 16);
+
+  min-width: calc(100svh * 16 / 9);
+  min-height: 100svh;
+
+  border: 0;
+}

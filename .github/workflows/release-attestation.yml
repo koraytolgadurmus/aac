@@ -1,0 +1,51 @@
+name: Release Attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_env:
+        description: PlatformIO environment
+        required: true
+        default: esp32dev_board_legacy
+      fw_version:
+        description: Firmware version tag
+        required: true
+        default: manual
+      board_rev:
+        description: Board revision
+        required: true
+        default: esp32dev-legacy
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: platformio run -e "${{ github.event.inputs.firmware_env }}"
+
+      - name: Generate attestation
+        run: |
+          python3 scripts/production/generate_release_attestation.py \
+            --firmware-bin ".pio/build/${{ github.event.inputs.firmware_env }}/firmware.bin" \
+            --firmware-env "${{ github.event.inputs.firmware_env }}" \
+            --version "${{ github.event.inputs.fw_version }}" \
+            --board-rev "${{ github.event.inputs.board_rev }}" \
+            --output "docs/audit/attestations/${{ github.event.inputs.firmware_env }}-${{ github.run_id }}.json"
+
+      - name: Upload attestation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-attestation
+          path: docs/audit/attestations/*.json

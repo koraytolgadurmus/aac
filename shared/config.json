@@ -1,0 +1,31 @@
+{
+  "manual": {
+    "COGNITO_SCOPES": "openid email profile",
+    "COGNITO_IDENTITY_POOL_ID": "",
+    "IOT_TOPIC_STATE": "aac/{id6}/state",
+    "IOT_TOPIC_TELEMETRY": "aac/{id6}/telemetry",
+    "IOT_TOPIC_SHADOW_UPDATE": "aac/{id6}/shadow/update",
+    "IOT_TOPIC_CMD": "aac/{id6}/cmd",
+    "IOT_TOPIC_EVT": "aac/{id6}/evt",
+    "DDB_DEVICE_OWNERSHIP_TABLE": "aac_device_ownership",
+    "DDB_DEVICE_STATE_TABLE": "aac_device_state",
+    "DDB_USER_DEVICES_TABLE": "aac_user_devices"
+  },
+  "generated": {
+    "AWS_REGION": "eu-central-1",
+    "AWS_ACCOUNT_ID": "824155916831",
+    "COGNITO_REGION": "eu-central-1",
+    "COGNITO_USER_POOL_ID": "eu-central-1_VyFAf2yq1",
+    "COGNITO_CLIENT_ID": "7eea10s9gmetffe0c8j2j0aq5f",
+    "COGNITO_DOMAIN": "aac-next-824155916831.auth.eu-central-1.amazoncognito.com",
+    "COGNITO_IDENTITY_POOL_ID": "eu-central-1:69e16781-e8b7-4e6c-9af8-20d0df13960f",
+    "CLOUD_BASE_URL": "https://2msyihi3og.execute-api.eu-central-1.amazonaws.com",
+    "CLOUD_IOT_ENDPOINT": "a29vjxa1zk2a3q-ats.iot.eu-central-1.amazonaws.com",
+    "IOT_DATA_ENDPOINT": "a29vjxa1zk2a3q-ats.iot.eu-central-1.amazonaws.com",
+    "IOT_POLICY_NAME": "aac-device-policy-dev",
+    "DDBUSERDEVICESTABLE": "aac_user_devices",
+    "DDBDEVICEOWNERSHIPBYOWNERGSI": "byOwnerUserId",
+    "DDBDEVICEOWNERSHIPTABLE": "aac_device_ownership",
+    "DDBDEVICESTATETABLE": "aac_device_state"
+  }
+}

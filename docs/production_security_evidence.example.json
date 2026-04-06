@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "deviceIdentity": {
+    "deviceId": "709373",
+    "boardRev": "esp32dev-legacy",
+    "keyType": "ec-p256"
+  },
+  "secureBoot": {
+    "enabled": true,
+    "version": "v2",
+    "digest": "SBV2_DIGEST_SLOT0"
+  },
+  "flashEncryption": {
+    "enabled": true,
+    "mode": "release"
+  },
+  "evidence": {
+    "generatedAt": "2026-03-31T00:00:00Z",
+    "verifiedBy": "factory-line-01",
+    "notes": "Captured from espefuse summary + signed production traveler"
+  }
+}

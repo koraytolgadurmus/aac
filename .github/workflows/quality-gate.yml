@@ -1,0 +1,73 @@
+name: Quality Gate
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: stable
+          cache: true
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Install preflight deps
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Flutter analyze
+        run: flutter analyze app/lib/main.dart
+
+      - name: Cloud preflight
+        run: ./scripts/aws/release-preflight.sh
+
+      - name: Dependency audit
+        env:
+          AUDIT_FAIL_LEVEL: high
+        run: ./scripts/qa/dependency_audit.sh
+
+      - name: Generate SBOM
+        run: python3 scripts/qa/generate_sbom.py
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: docs/audit/sbom/latest-sbom.json
+
+      - name: Build firmware (legacy)
+        run: platformio run -e esp32dev_board_legacy
+
+      - name: Build firmware (aux)
+        run: platformio run -e esp32dev_board_aux
+
+      - name: Branch protection policy check (optional)
+        if: ${{ secrets.GH_ADMIN_TOKEN != '' }}
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+          GH_BRANCH: main
+        run: ./scripts/qa/check_branch_protection.sh

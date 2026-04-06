@@ -1,0 +1,68 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DynamoDbDataAccess",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:Scan"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-device-ownership",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-device-ownership/index/byOwnerUserId",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-device-state",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-user-devices",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-user-devices/index/byDeviceId",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-device-invites",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-device-invites/index/byDeviceId",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-integration-links",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-integration-links/index/byDeviceId",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-cmd-idempotency",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-audit",
+        "arn:aws:dynamodb:eu-central-1:123456789012:table/aac-dev-rate-limit"
+      ]
+    },
+    {
+      "Sid": "IotDataPlaneAccess",
+      "Effect": "Allow",
+      "Action": [
+        "iot:Publish",
+        "iot:GetThingShadow",
+        "iot:UpdateThingShadow"
+      ],
+      "Resource": [
+        "arn:aws:iot:eu-central-1:123456789012:topic/aac/*/cmd",
+        "arn:aws:iot:eu-central-1:123456789012:thing/aac-*"
+      ]
+    },
+    {
+      "Sid": "IotJobsControlPlane",
+      "Effect": "Allow",
+      "Action": [
+        "iot:CreateJob",
+        "iot:DescribeJob",
+        "iot:CancelJob",
+        "iot:DescribeThing"
+      ],
+      "Resource": [
+        "arn:aws:iot:eu-central-1:123456789012:job/*",
+        "arn:aws:iot:eu-central-1:123456789012:thing/aac-*",
+        "arn:aws:iot:eu-central-1:123456789012:thing/??????"
+      ]
+    },
+    {
+      "Sid": "CloudWatchLogsWrite",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:eu-central-1:123456789012:*"
+    }
+  ]
+}

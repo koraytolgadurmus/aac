@@ -1,0 +1,51 @@
+name: Cloud CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  cloud-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install preflight deps
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run preflight (build + syntax)
+        run: ./scripts/aws/release-preflight.sh
+
+      - name: Run strict production gate (optional)
+        if: ${{ secrets.PROD_SECURITY_EVIDENCE_JSON != '' && secrets.PROD_DEVICE_PRIVATE_KEY != '' }}
+        env:
+          PROD_SECURITY_EVIDENCE_JSON: ${{ secrets.PROD_SECURITY_EVIDENCE_JSON }}
+          PROD_DEVICE_PRIVATE_KEY: ${{ secrets.PROD_DEVICE_PRIVATE_KEY }}
+        run: |
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          printf '%s\n' "$PROD_DEVICE_PRIVATE_KEY" > "$tmpdir/device_private.key"
+          printf '%s\n' "$PROD_SECURITY_EVIDENCE_JSON" > "$tmpdir/production-evidence.json"
+          AAC_SECRET_DIR="$tmpdir" ./scripts/aws/release-preflight.sh \
+            --with-firmware \
+            --firmware-env esp32dev_board_legacy \
+            --strict-prod \
+            --prod-evidence "$tmpdir/production-evidence.json"
+
+      - name: Run cloud smoke via preflight (optional)
+        if: ${{ secrets.CLOUD_SMOKE_API_BASE_URL != '' && secrets.CLOUD_SMOKE_ACCESS_TOKEN != '' }}
+        env:
+          API_BASE_URL: ${{ secrets.CLOUD_SMOKE_API_BASE_URL }}
+          ACCESS_TOKEN: ${{ secrets.CLOUD_SMOKE_ACCESS_TOKEN }}
+          DEVICE_ID: ${{ secrets.CLOUD_SMOKE_DEVICE_ID }}
+          CLAIM_SECRET: ${{ secrets.CLOUD_SMOKE_CLAIM_SECRET }}
+          SMOKE_STRICT_DESIRED: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
+        run: ./scripts/aws/release-preflight.sh --with-smoke

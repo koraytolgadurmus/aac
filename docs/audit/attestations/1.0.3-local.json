@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-04-06T18:04:24Z",
+  "project": "aac",
+  "build": {
+    "firmwareEnv": "esp32dev_board_legacy",
+    "version": "1.0.3",
+    "boardRev": "esp32dev-legacy",
+    "gitCommit": "unknown"
+  },
+  "artifacts": [
+    {
+      "path": "/Users/koraytolgadurmus/Documents/PlatformIO/Projects/aac/.pio/build/esp32dev_board_legacy/firmware.bin",
+      "sha256": "800ce6de9b1655094ebbc734eb5e457305e22952b083a8e7b0f36d982921234a",
+      "sizeBytes": 1499232
+    }
+  ]
+}
