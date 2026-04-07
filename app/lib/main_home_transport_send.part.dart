@@ -111,7 +111,7 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
         !_localUnreachableActive &&
         lastLocalOkAt != null &&
         localOkAgeMs >= 0 &&
-        localOkAgeMs <= 10000;
+        localOkAgeMs <= 60000;
     final localHasCachedIp = _getActiveDeviceLastIp()?.isNotEmpty == true;
     final localIp = (!onSoftAp && baseHost.isNotEmpty) ? baseHost : '-';
 

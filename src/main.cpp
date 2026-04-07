@@ -552,6 +552,8 @@ static const uint32_t PROV_RETRY_MS = 15000;
 static const uint32_t PROV_RETRY_MAX_MS = 600000;
 static uint32_t g_provLastAttemptMs = 0;
 static uint32_t g_provBackoffMs = PROV_RETRY_MS;
+static uint8_t g_provFailStreak = 0;
+static uint32_t g_provSuspendUntilMs = 0;
 static const uint32_t TLSCFG_RETRY_MS = 5000;
 static const uint32_t TLSCFG_RETRY_MAX_MS = 60000;
 static uint32_t g_tlsCfgLastAttemptMs = 0;
@@ -1545,6 +1547,10 @@ static bool provisionIfNeeded() {
     return false;
   }
   const uint32_t nowMs = millis();
+  if (g_provSuspendUntilMs != 0 &&
+      (int32_t)(g_provSuspendUntilMs - nowMs) > 0) {
+    return false;
+  }
   if (nowMs - g_provLastAttemptMs < g_provBackoffMs) {
     return false;
   }
@@ -1724,6 +1730,12 @@ static bool provisionIfNeeded() {
     g_provisioningInProgress = false;
     g_mqttNet.stop();
     g_provBackoffMs = min(PROV_RETRY_MAX_MS, g_provBackoffMs * 2);
+    g_provFailStreak = (uint8_t)min(255, (int)g_provFailStreak + 1);
+    if (g_provFailStreak >= 3) {
+      g_provSuspendUntilMs = millis() + 600000UL; // 10 min circuit breaker
+      Serial.println("[PROV] circuit breaker: suspending retries for 600s");
+      g_provFailStreak = 0;
+    }
     return false;
   }
 
@@ -1760,6 +1772,12 @@ static bool provisionIfNeeded() {
     g_provisioningInProgress = false;
     g_mqttNet.stop();
     g_provBackoffMs = min(PROV_RETRY_MAX_MS, g_provBackoffMs * 2);
+    g_provFailStreak = (uint8_t)min(255, (int)g_provFailStreak + 1);
+    if (g_provFailStreak >= 3) {
+      g_provSuspendUntilMs = millis() + 600000UL; // 10 min circuit breaker
+      Serial.println("[PROV] circuit breaker: suspending retries for 600s");
+      g_provFailStreak = 0;
+    }
     return false;
   }
 
@@ -1780,6 +1798,8 @@ static bool provisionIfNeeded() {
   g_provisioned = true;
   g_tlsConfigured = false;
   g_provBackoffMs = PROV_RETRY_MS;
+  g_provFailStreak = 0;
+  g_provSuspendUntilMs = 0;
   g_claimDeletePending = true;
   g_provisioningInProgress = false;
   g_deviceCertInvalidStreak = 0;

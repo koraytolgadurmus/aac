@@ -1983,13 +1983,13 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
   Future<bool> _probeLocalHealthWithRetry(String base) async {
     final ok1 = await _probeInfoReachable(
       base,
-      timeout: const Duration(milliseconds: 1500),
+      timeout: const Duration(milliseconds: 2500),
     );
     if (ok1) return true;
     await Future.delayed(const Duration(milliseconds: 500));
     return _probeInfoReachable(
       base,
-      timeout: const Duration(milliseconds: 2000),
+      timeout: const Duration(milliseconds: 3500),
     );
   }
 
