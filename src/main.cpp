@@ -6442,6 +6442,15 @@ static inline bool primaryTransportAvailable() {
 }
 
 static inline bool recoveryTransportsAllowed(uint32_t nowMs) {
+  // Never suppress recovery transports while an active BLE session/provision
+  // hold is in effect. Otherwise BLE can be dropped in the middle of Wi-Fi
+  // onboarding before the app receives STA IP / mDNS handoff details.
+  if (g_blePolicyHoldUntilMs != 0 &&
+      (int32_t)(g_blePolicyHoldUntilMs - nowMs) > 0) {
+    g_recoverySuppressed = false;
+    g_recoveryDeferSinceMs = 0;
+    return true;
+  }
   // IR-first model:
   // - Unowned devices stay locked until an explicit pairing/recovery window is opened.
   // - Owned devices without STA creds can still use recovery transports.
