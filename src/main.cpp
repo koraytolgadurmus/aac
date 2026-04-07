@@ -545,8 +545,11 @@ static const uint32_t MQTT_RECOVERY_COOLDOWN_MS = 20000;
 static const uint32_t MQTT_RESTART_COOLDOWN_MS = 600000;
 static const uint32_t MQTT_WIFI_RECOVERY_COOLDOWN_MS = 120000;
 static uint32_t g_mqttLastWifiRecoverMs = 0;
-static const uint32_t PROV_RETRY_MS = 5000;
-static const uint32_t PROV_RETRY_MAX_MS = 60000;
+// Keep provisioning retries from monopolizing the main loop when AWS claim
+// flow is failing (e.g., policy/topic issues). Longer backoff preserves local
+// control responsiveness.
+static const uint32_t PROV_RETRY_MS = 15000;
+static const uint32_t PROV_RETRY_MAX_MS = 600000;
 static uint32_t g_provLastAttemptMs = 0;
 static uint32_t g_provBackoffMs = PROV_RETRY_MS;
 static const uint32_t TLSCFG_RETRY_MS = 5000;
@@ -1708,7 +1711,7 @@ static bool provisionIfNeeded() {
     }
   }
   const uint32_t t0 = millis();
-  while (!g_provCertOk && !g_provCertFail && (millis() - t0) < 15000) {
+  while (!g_provCertOk && !g_provCertFail && (millis() - t0) < 8000) {
     g_mqtt.loop();
     delay(10);
   }
@@ -1744,7 +1747,7 @@ static bool provisionIfNeeded() {
   }
   Serial.printf("[PROV] provision request SerialNumber=%s\n", getDeviceId6().c_str());
   const uint32_t t1 = millis();
-  while (!g_provThingOk && !g_provThingFail && (millis() - t1) < 15000) {
+  while (!g_provThingOk && !g_provThingFail && (millis() - t1) < 8000) {
     g_mqtt.loop();
     delay(10);
   }
