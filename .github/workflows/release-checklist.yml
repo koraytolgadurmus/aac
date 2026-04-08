@@ -1,0 +1,88 @@
+name: Release Checklist
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      firmware_env:
+        description: PlatformIO firmware environment
+        required: true
+        default: esp32dev_board_legacy
+      strict_prod:
+        description: Enable strict production gates
+        required: true
+        default: "false"
+
+jobs:
+  release-checklist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FW_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.firmware_env || 'esp32dev_board_legacy' }}
+      STRICT_PROD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.strict_prod || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.35.0"
+          channel: stable
+          cache: true
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Install release dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Validate version policy
+        run: ./scripts/qa/version_policy_check.sh
+
+      - name: Validate GitHub readiness
+        run: ./scripts/qa/github_readiness.sh
+
+      - name: Run release preflight
+        run: |
+          if [[ "${STRICT_PROD}" == "true" ]]; then
+            echo "[INFO] Strict production gate enabled"
+            ./scripts/aws/release-preflight.sh --with-firmware --firmware-env "${FW_ENV}" --strict-prod
+          else
+            ./scripts/aws/release-preflight.sh --with-firmware --firmware-env "${FW_ENV}"
+          fi
+
+      - name: Generate SBOM
+        run: python3 scripts/qa/generate_sbom.py
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-sbom-${{ github.run_id }}
+          path: docs/audit/sbom/latest-sbom.json
+
+      - name: Release checklist summary
+        run: |
+          {
+            echo "## Release Checklist Result"
+            echo "- Tag/Event: ${{ github.ref_name }}"
+            echo "- Firmware env: ${FW_ENV}"
+            echo "- Strict production: ${STRICT_PROD}"
+            echo "- Version policy: passed"
+            echo "- GitHub readiness: passed"
+            echo "- Release preflight: passed"
+            echo "- SBOM: generated"
+          } >> "$GITHUB_STEP_SUMMARY"

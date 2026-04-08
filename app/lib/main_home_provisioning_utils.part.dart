@@ -1016,6 +1016,12 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
     ValueSetter<String?>? onDeviceId,
     ValueSetter<String?>? onHost,
   }) {
+    void rememberIp(String ipRaw) {
+      final ip = ipRaw.trim();
+      if (ip.isEmpty || ip == '0.0.0.0') return;
+      unawaited(_updateActiveDeviceLastIp(ip));
+    }
+
     try {
       notifySub?.cancel();
     } catch (_) {}
@@ -1030,6 +1036,7 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
         ).firstMatch(raw);
         final ip = ipv4?.group(1)?.trim();
         if (ip != null && ip.isNotEmpty && ip != '0.0.0.0') {
+          rememberIp(ip);
           if (!completer.isCompleted) {
             debugPrint('[BLE] notify salvage ip=$ip');
             completer.complete(ip);
@@ -1114,6 +1121,7 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
 
             final flatIp = obj['ip'];
             if (flatIp is String && flatIp.isNotEmpty && flatIp != '0.0.0.0') {
+              rememberIp(flatIp);
               if (!completer.isCompleted) completer.complete(flatIp.trim());
               return;
             }
@@ -1141,6 +1149,7 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
                   (prov['ip'] ?? prov['sta_ip'])?.toString().trim() ?? '';
               final pSta = prov['sta'] == true || prov['sta_ok'] == true;
               if (pSta && pIp.isNotEmpty && pIp != '0.0.0.0') {
+                rememberIp(pIp);
                 if (!completer.isCompleted) completer.complete(pIp);
                 return;
               }
@@ -1165,6 +1174,7 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
               }
               final chosen = ip1.isNotEmpty ? ip1 : ip2;
               if (staOk && chosen.isNotEmpty && chosen != '0.0.0.0') {
+                rememberIp(chosen);
                 if (!completer.isCompleted) completer.complete(chosen);
                 return;
               }
@@ -1190,6 +1200,7 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
                   network['sta_ok'] == true ||
                   network['sta'] == 3;
               if (nSta && nIp.isNotEmpty && nIp != '0.0.0.0') {
+                rememberIp(nIp);
                 if (!completer.isCompleted) completer.complete(nIp);
                 return;
               }
@@ -1951,9 +1962,9 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
     try {
       final isAp = base == 'http://192.168.4.1';
       final path = isAp ? '/info' : '/api/status';
-      final r = await http
-          .get(Uri.parse('$base$path'), headers: api.authHeaders())
-          .timeout(timeout);
+      // Reachability probe must not depend on signed auth headers; when auth
+      // header generation stalls, local transport is falsely marked unhealthy.
+      final r = await http.get(Uri.parse('$base$path')).timeout(timeout);
       final ok =
           (r.statusCode >= 200 && r.statusCode < 300) ||
           r.statusCode == 401 ||
@@ -1983,13 +1994,13 @@ extension _HomeScreenProvisioningUtilsPart on _HomeScreenState {
   Future<bool> _probeLocalHealthWithRetry(String base) async {
     final ok1 = await _probeInfoReachable(
       base,
-      timeout: const Duration(milliseconds: 1500),
+      timeout: const Duration(milliseconds: 900),
     );
     if (ok1) return true;
-    await Future.delayed(const Duration(milliseconds: 500));
+    await Future.delayed(const Duration(milliseconds: 150));
     return _probeInfoReachable(
       base,
-      timeout: const Duration(milliseconds: 2000),
+      timeout: const Duration(milliseconds: 1200),
     );
   }
 

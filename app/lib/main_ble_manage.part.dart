@@ -38,7 +38,11 @@ extension _HomeScreenBleManagePart on _HomeScreenState {
       final preferredId6 = (activeId6 != null && activeId6.trim().isNotEmpty)
           ? activeId6.trim()
           : null;
-      final autoTargetId6 = preferredId6;
+      final autoTargetId6 =
+          preferredId6 ??
+          ((lastId6 != null && lastId6.trim().isNotEmpty)
+              ? lastId6.trim()
+              : null);
       debugPrint(
         '[BLE][MANAGE] target id6 decision active=$activeId6 last=$lastId6 chosen=$autoTargetId6',
       );
@@ -157,12 +161,16 @@ extension _HomeScreenBleManagePart on _HomeScreenState {
           setupPassHint: setupPass,
           source: 'ble_manage_sheet',
         );
-        if (!ownerReady) {
+        final ownerSignal =
+            ownerReady || state?.ownerExists == true || _isOwnerRole();
+        if (!ownerSignal) {
           _setClaimFlowStage(
             _ClaimFlowStage.failed,
             detail:
                 'Owner ataması doğrulanamadı. Cloud öncesi BLE kurulumunu tekrar başlatın.',
           );
+        } else {
+          await _enableCloudAfterBleProvisionBestEffort();
         }
       }
       if (provisionSucceeded && _postOnboardingLocalReadyPromptPending) {
@@ -188,6 +196,43 @@ extension _HomeScreenBleManagePart on _HomeScreenState {
       _endTransportSession('ble-manage');
       _bleManageSheetOpen = false;
       _resumeBackground(reason: 'ble-manage');
+    }
+  }
+
+  Future<void> _enableCloudAfterBleProvisionBestEffort() async {
+    final now = DateTime.now();
+    if (_cloudManualDisableUntil != null &&
+        now.isBefore(_cloudManualDisableUntil!)) {
+      debugPrint(
+        '[CLOUD][BLE] clearing manual disable lock due to fresh BLE owner provisioning',
+      );
+      _cloudManualDisableUntil = null;
+    }
+    if (_cloudEndpointMissingForActive()) {
+      debugPrint('[CLOUD][BLE] auto-enable skipped (endpoint missing)');
+      return;
+    }
+
+    await _autoEnableCloudLocalFlag(reason: 'ble_owner_ready');
+    if (!_cloudUserEnabledLocal) {
+      debugPrint('[CLOUD][BLE] auto-enable skipped (local flag unchanged)');
+      return;
+    }
+
+    final cloudPayload = <String, dynamic>{'enabled': true};
+    final endpoint = _effectiveCloudEndpointNormalized();
+    if (endpoint != null && endpoint.isNotEmpty) {
+      cloudPayload['endpoint'] = endpoint;
+      cloudPayload['iotEndpoint'] = endpoint;
+    }
+
+    final sent = await _send({'cloud': cloudPayload}, forceLocalOnly: false);
+    debugPrint('[CLOUD][BLE] local cloud enable cmd sent=$sent');
+    if (!sent) return;
+
+    await _awaitCloudEnableAckForOnboarding(total: const Duration(seconds: 12));
+    if (_cloudLoggedIn()) {
+      await _ensureCloudReadyForActiveDevice(force: true, showSnack: false);
     }
   }
 

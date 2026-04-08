@@ -107,11 +107,13 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
         : -1;
     final localRecentOk =
         !onSoftAp &&
-        !_localDnsFailActive &&
-        !_localUnreachableActive &&
         lastLocalOkAt != null &&
         localOkAgeMs >= 0 &&
-        localOkAgeMs <= 10000;
+        localOkAgeMs <= 60000;
+    final recentStateUpdate =
+        !onSoftAp &&
+        _lastUpdate != null &&
+        now.difference(_lastUpdate!) <= const Duration(seconds: 8);
     final localHasCachedIp = _getActiveDeviceLastIp()?.isNotEmpty == true;
     final localIp = (!onSoftAp && baseHost.isNotEmpty) ? baseHost : '-';
 
@@ -198,8 +200,12 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
       return sendViaBle();
     }
 
-    // 0) Cloud-first if healthy/prefer window and MQTT is connected
+    // 0) Cloud-first only when there is no local target at all.
+    // If local target exists, always try local first for deterministic actuation
+    // and keep cloud as fallback.
     if (!forceLocalOnly &&
+        localIp == '-' &&
+        !localRecentOk &&
         cloudReady &&
         cloudId6 != null &&
         cloudId6.isNotEmpty &&
@@ -241,15 +247,29 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     } else if (!forceLocalOnly && nonOwnerKnown) {
       localHealth = 'skip_non_owner';
     } else if (localIp != '-') {
-      localHealthOk =
-          localRecentOk || await _probeLocalHealthWithRetry(api.baseUrl);
+      if (localRecentOk || recentStateUpdate) {
+        localHealthOk = true;
+        localHealth = 'cached_ok';
+      } else {
+        localHealthOk = await _probeLocalHealthWithRetry(api.baseUrl);
+      }
     }
     localHealth = localHealthOk ? 'ok' : 'fail';
+    final lastLocalOkStillWarm =
+        _lastLocalOkAt != null &&
+        now.difference(_lastLocalOkAt!) < const Duration(minutes: 5);
+    final allowLocalSoftRetry =
+        !localHealthOk && localIp != '-' && lastLocalOkStillWarm;
     if (!localHealthOk && localIp != '-') {
-      debugPrint('[CMD] local health failed, skipping local');
+      if (allowLocalSoftRetry) {
+        localHealth = 'soft_retry';
+        debugPrint('[CMD] local health failed; soft-retry enabled');
+      } else {
+        debugPrint('[CMD] local health failed, skipping local');
+      }
     }
 
-    if (localHealthOk) {
+    if (localHealthOk || allowLocalSoftRetry) {
       logPath(chosen: 'local');
       try {
         final identityOk = await _ensureEndpointMatchesSelectedDevice(
@@ -279,6 +299,7 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
             _captureLastIpForBaseInBackground(api.baseUrl);
             _localDnsFailUntil = null;
             _localUnreachableUntil = null;
+            _localRateLimitedUntil = null;
             _lastLocalOkAt = DateTime.now();
             _markConnected();
           } else {
@@ -293,6 +314,16 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
                 _markLocalDnsFailure();
               } else if (_looksLikeLocalUnreachable(lastErr)) {
                 _markLocalUnreachable();
+              }
+            }
+            final errCode = (api.lastErrCode ?? '').trim().toLowerCase();
+            if (api.lastHttpStatus == 429 || errCode == 'rate_limited') {
+              final until = DateTime.now().add(
+                const Duration(milliseconds: 1200),
+              );
+              if (_localRateLimitedUntil == null ||
+                  until.isAfter(_localRateLimitedUntil!)) {
+                _localRateLimitedUntil = until;
               }
             }
             // If firmware rejects local control because cloud mode is enabled,
@@ -469,6 +500,14 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     bool promptForQr = true,
     bool forceLocalOnly = false,
   }) async {
+    final cloudRaw = body['cloud'];
+    final isCloudDisableCmd =
+        cloudRaw is Map &&
+        (cloudRaw['enabled'] == false || cloudRaw['enabled'] == 0);
+    if (isCloudDisableCmd && !_consumeCloudDisableIntent()) {
+      debugPrint('[CLOUD] blocked cloud disable command: missing user intent');
+      return false;
+    }
     if (_isNoopCommandAgainstState(body, state)) {
       debugPrint('[CMD] skip noop key=${_canonicalCmdKey(body)}');
       return false;
@@ -478,6 +517,10 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
       _showSnack(t.t('device_not'));
     }
     final now = DateTime.now();
+    final localRateLimitUntil = _localRateLimitedUntil;
+    if (localRateLimitUntil != null && now.isBefore(localRateLimitUntil)) {
+      await Future.delayed(localRateLimitUntil.difference(now));
+    }
     final key = _canonicalCmdKey(body);
     final isControlPayload =
         body.keys.every(
@@ -520,7 +563,9 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     final lastAt = _lastCmdSendAt;
     if (lastAt != null) {
       final delta = now.difference(lastAt);
-      const minGap = Duration(milliseconds: 250);
+      final minGap = isControlPayload
+          ? const Duration(milliseconds: 450)
+          : const Duration(milliseconds: 250);
       if (delta < minGap) {
         await Future.delayed(minGap - delta);
       }
@@ -754,6 +799,9 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
   Future<String?> _readEndpointId6({
     Duration timeout = const Duration(seconds: 2),
   }) async {
+    final host = Uri.tryParse(api.baseUrl)?.host.trim() ?? '';
+    final onSoftAp = host == '192.168.4.1';
+
     Future<String?> quickRead(String path) async {
       try {
         final uri = Uri.parse('${api.baseUrl}$path');
@@ -777,10 +825,12 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
       _rememberEndpointId6ForCurrentBase(quickStatus);
       return quickStatus;
     }
-    final quickInfo = await quickRead('/info');
-    if (quickInfo != null && quickInfo.isNotEmpty) {
-      _rememberEndpointId6ForCurrentBase(quickInfo);
-      return quickInfo;
+    if (onSoftAp) {
+      final quickInfo = await quickRead('/info');
+      if (quickInfo != null && quickInfo.isNotEmpty) {
+        _rememberEndpointId6ForCurrentBase(quickInfo);
+        return quickInfo;
+      }
     }
 
     try {
@@ -795,17 +845,19 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     } catch (e) {
       debugPrint('[GUARD] read endpoint id from status failed: $e');
     }
-    try {
-      final info = await api.fetchInfoRaw(timeout: timeout);
-      final fromInfo = info == null
-          ? null
-          : _extractEndpointId6FromInfoJson(info);
-      if (fromInfo != null && fromInfo.isNotEmpty) {
-        _rememberEndpointId6ForCurrentBase(fromInfo);
-        return fromInfo;
+    if (onSoftAp) {
+      try {
+        final info = await api.fetchInfoRaw(timeout: timeout);
+        final fromInfo = info == null
+            ? null
+            : _extractEndpointId6FromInfoJson(info);
+        if (fromInfo != null && fromInfo.isNotEmpty) {
+          _rememberEndpointId6ForCurrentBase(fromInfo);
+          return fromInfo;
+        }
+      } catch (e) {
+        debugPrint('[GUARD] read endpoint id from info failed: $e');
       }
-    } catch (e) {
-      debugPrint('[GUARD] read endpoint id from info failed: $e');
     }
     return _recentEndpointId6ForCurrentBase();
   }
@@ -827,6 +879,21 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     );
   }
 
+  bool _hostHintsSelectedId6(String selectedId6) {
+    final host = (Uri.tryParse(api.baseUrl)?.host ?? '').trim().toLowerCase();
+    if (host.isEmpty) return false;
+    if (_baseHostLooksLikeIpv4(host)) {
+      final lastIp = (_getActiveDeviceLastIp() ?? '').trim();
+      return lastIp.isNotEmpty && host == lastIp;
+    }
+    final mdnsHost = (mdnsHostForId6(
+      selectedId6,
+      rawIdHint: selectedId6,
+    )).trim().toLowerCase();
+    if (mdnsHost.isNotEmpty && host == '$mdnsHost.local') return true;
+    return host.contains(selectedId6);
+  }
+
   Future<bool> _ensureEndpointMatchesSelectedDevice({
     required String transport,
   }) async {
@@ -834,6 +901,21 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     if (selectedId6 == null || selectedId6.isEmpty) return true;
     final endpointId6 = await _readEndpointId6();
     if (endpointId6 == null || endpointId6.isEmpty) {
+      final cached = _recentEndpointId6ForCurrentBase(
+        maxAge: const Duration(minutes: 20),
+      );
+      if (cached == selectedId6) {
+        debugPrint(
+          '[GUARD] endpoint id unavailable; allowing via cached match selected=$selectedId6',
+        );
+        return true;
+      }
+      if (_hostHintsSelectedId6(selectedId6)) {
+        debugPrint(
+          '[GUARD] endpoint id unavailable; allowing via host hint selected=$selectedId6 host=${Uri.tryParse(api.baseUrl)?.host ?? ''}',
+        );
+        return true;
+      }
       _showSnack(
         'Bağlı cihaz kimliği doğrulanamadı. ${transport.toUpperCase()} komutu güvenlik nedeniyle engellendi.',
       );
@@ -897,10 +979,17 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     final ip = await mdns.mdnsResolveHost(fqdn, timeout: timeout);
     if (ip != null) {
       debugPrint('[mDNS] A $fqdn -> $ip');
+      _mdnsNoIpv4LogAtByHost.remove(fqdn.toLowerCase());
       unawaited(_updateActiveDeviceLastIp(ip));
       unawaited(_updateActiveDeviceMdnsHost(host.replaceAll('.local', '')));
     } else {
-      debugPrint('[mDNS] no IPv4 A record for $fqdn');
+      final key = fqdn.toLowerCase();
+      final now = DateTime.now();
+      final last = _mdnsNoIpv4LogAtByHost[key];
+      if (last == null || now.difference(last) >= const Duration(seconds: 30)) {
+        _mdnsNoIpv4LogAtByHost[key] = now;
+        debugPrint('[mDNS] no IPv4 A record for $fqdn');
+      }
     }
     return ip;
   }
@@ -913,6 +1002,12 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
       return;
     }
     if (!host.endsWith('.local')) return;
+    final now = DateTime.now();
+    final last = _mdnsBgResolveAtByHost[host];
+    if (last != null && now.difference(last) < const Duration(seconds: 30)) {
+      return;
+    }
+    _mdnsBgResolveAtByHost[host] = now;
     unawaited(() async {
       try {
         await _mdnsResolveHost(

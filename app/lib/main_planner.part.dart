@@ -134,21 +134,17 @@ extension _HomeScreenPlanner on _HomeScreenState {
       debugPrint('[PLANNER] skip: not connected');
       return;
     }
-    // If no plans at all, or all are disabled, switch to AUTO once and stop touching anything else
+    // If no plans at all, or all are disabled, planner must not drive mode/state.
+    // Keep manual/user control untouched.
     final bool hasAnyEnabledPlan = _plans.any((p) => p.enabled);
     if (!hasAnyEnabledPlan) {
-      if (!_autoAfterNoPlanSent) {
-        if (!_networkAutoPollingAllowed) {
-          debugPrint('[PLANNER] AUTO suppressed until network polling opt-in');
-          return;
-        }
-        debugPrint('[PLANNER] No enabled plans; triggering AUTO once');
-        _autoAfterNoPlanSent = true;
-        _plannerWasActive = false; // reset planner activity state
-        // Only change mode, leave lights/ion/RGB as-is
-        Future.microtask(() => _send({'mode': 5}, promptForQr: false));
+      if (_plannerWasActive || _autoAfterNoPlanSent || _manualOverride) {
+        _plannerWasActive = false;
+        _autoAfterNoPlanSent = false;
+        _manualOverride = false;
       }
-      return; // nothing else to evaluate
+      debugPrint('[PLANNER] no enabled plans; leaving device state as-is');
+      return;
     }
 
     // There are enabled plans; evaluate current activity window(s)

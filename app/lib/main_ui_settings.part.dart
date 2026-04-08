@@ -383,6 +383,56 @@ extension _HomeScreenUiSettingsPart on _HomeScreenState {
                                   ) ??
                                   false;
                               if (!okConfirm) return;
+                              if (!mounted) return;
+                              var verifyInput = '';
+                              final verifyOk =
+                                  await showDialog<bool>(
+                                    context: context,
+                                    builder: (ctx) => AlertDialog(
+                                      title: const Text(
+                                        'Son Onay (Cloud Kaldırma)',
+                                      ),
+                                      content: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Cloud sahipliğini kaldırmak için cihaz kodunu yazın: $id6',
+                                          ),
+                                          const SizedBox(height: 10),
+                                          TextField(
+                                            onChanged: (v) =>
+                                                verifyInput = v.trim(),
+                                            decoration: const InputDecoration(
+                                              hintText: 'Örn: 693133',
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.of(ctx).pop(false),
+                                          child: Text(t.literal('Vazgeç')),
+                                        ),
+                                        FilledButton(
+                                          onPressed: () {
+                                            final okTyped = verifyInput == id6;
+                                            Navigator.of(ctx).pop(okTyped);
+                                          },
+                                          child: Text(t.literal('Doğrula')),
+                                        ),
+                                      ],
+                                    ),
+                                  ) ??
+                                  false;
+                              if (!verifyOk) {
+                                _showSnack(
+                                  'Kod doğrulanmadı, cloud kaldırma iptal.',
+                                );
+                                return;
+                              }
                               await _cloudRefreshIfNeeded();
                               final ok = await cloudApi.unclaimDevice(
                                 id6,
@@ -706,6 +756,35 @@ extension _HomeScreenUiSettingsPart on _HomeScreenState {
                     value: _cloudUserEnabledLocal,
                     onChanged: _isOwnerRole() && !_cloudSetupInFlight
                         ? (v) async {
+                            if (!v) {
+                              final okDisable =
+                                  await showDialog<bool>(
+                                    context: context,
+                                    builder: (ctx) => AlertDialog(
+                                      title: Text(t.literal('Cloud’u Kapat')),
+                                      content: Text(
+                                        t.literal(
+                                          'Cloud kapanırsa uzaktan kontrol durur. Sadece yerel/BLE ile yönetebilirsiniz. Devam edilsin mi?',
+                                        ),
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.of(ctx).pop(false),
+                                          child: Text(t.literal('Vazgeç')),
+                                        ),
+                                        FilledButton(
+                                          onPressed: () =>
+                                              Navigator.of(ctx).pop(true),
+                                          child: Text(t.literal('Kapat')),
+                                        ),
+                                      ],
+                                    ),
+                                  ) ??
+                                  false;
+                              if (!okDisable) return;
+                              _armCloudDisableIntent();
+                            }
                             final previous = _cloudUserEnabledLocal;
                             if (v) {
                               _cloudManualDisableUntil = null;

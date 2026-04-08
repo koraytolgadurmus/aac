@@ -167,6 +167,21 @@ Preferences prefs;
 #ifndef HTTP_DIAG_LOG
 #define HTTP_DIAG_LOG 0
 #endif
+#ifndef ENABLE_HA_LOCAL_MQTT
+#define ENABLE_HA_LOCAL_MQTT 0
+#endif
+#ifndef HA_LOCAL_MQTT_HOST
+#define HA_LOCAL_MQTT_HOST ""
+#endif
+#ifndef HA_LOCAL_MQTT_PORT
+#define HA_LOCAL_MQTT_PORT 1883
+#endif
+#ifndef HA_LOCAL_MQTT_USER
+#define HA_LOCAL_MQTT_USER ""
+#endif
+#ifndef HA_LOCAL_MQTT_PASS
+#define HA_LOCAL_MQTT_PASS ""
+#endif
 // ---- Forward declarations (local-safe) ----
 enum class CmdSource : uint8_t { UNKNOWN = 0, BLE = 1, HTTP = 2, TCP = 3, MQTT = 4 };
 static bool equalsIgnoreCaseStr(const String& a, const String& b);
@@ -529,6 +544,15 @@ static void setCloudState(CloudState next, const char* reason = nullptr) {
 static WiFiClientSecure g_mqttNet;
 static PubSubClient g_mqtt(g_mqttNet);
 static String g_mqttServerHost;
+#if ENABLE_HA_LOCAL_MQTT
+static WiFiClient g_haMqttNet;
+static PubSubClient g_haMqtt(g_haMqttNet);
+static uint32_t g_haMqttLastAttemptMs = 0;
+static uint32_t g_haMqttBackoffMs = 3000;
+static const uint32_t HA_MQTT_RECONNECT_MAX_MS = 30000;
+static bool g_haMqttSubscribed = false;
+static uint32_t g_haLastPubMs = 0;
+#endif
 static uint32_t g_mqttLastAttemptMs = 0;
 static const uint32_t MQTT_RECONNECT_MS = 5000;
 static const uint32_t MQTT_RECONNECT_MAX_MS = 60000;
@@ -545,10 +569,15 @@ static const uint32_t MQTT_RECOVERY_COOLDOWN_MS = 20000;
 static const uint32_t MQTT_RESTART_COOLDOWN_MS = 600000;
 static const uint32_t MQTT_WIFI_RECOVERY_COOLDOWN_MS = 120000;
 static uint32_t g_mqttLastWifiRecoverMs = 0;
-static const uint32_t PROV_RETRY_MS = 5000;
-static const uint32_t PROV_RETRY_MAX_MS = 60000;
+// Keep provisioning retries from monopolizing the main loop when AWS claim
+// flow is failing (e.g., policy/topic issues). Longer backoff preserves local
+// control responsiveness.
+static const uint32_t PROV_RETRY_MS = 15000;
+static const uint32_t PROV_RETRY_MAX_MS = 600000;
 static uint32_t g_provLastAttemptMs = 0;
 static uint32_t g_provBackoffMs = PROV_RETRY_MS;
+static uint8_t g_provFailStreak = 0;
+static uint32_t g_provSuspendUntilMs = 0;
 static const uint32_t TLSCFG_RETRY_MS = 5000;
 static const uint32_t TLSCFG_RETRY_MAX_MS = 60000;
 static uint32_t g_tlsCfgLastAttemptMs = 0;
@@ -565,13 +594,15 @@ static bool g_provisioningInProgress = false;
 static bool g_tlsConfigured = false;
 static bool g_cloudUserEnabled = false;
 static bool g_claimDeletePending = false;
+static bool g_haDiscoveryDirty = true;
+static uint32_t g_haDiscoveryLastPublishMs = 0;
 static uint32_t g_nextDeviceCertValidationMs = 0;
 static uint8_t g_deviceCertInvalidStreak = 0;
 // Re-provision trigger latency was too long (60s * 3 ~= 3 min).
 // Keep a small debounce for transient FS hiccups but recover much faster
 // when device cert/key are genuinely missing.
-static const uint32_t DEVICE_CERT_VALIDATION_INTERVAL_MS = 15000;
-static const uint8_t DEVICE_CERT_INVALID_STREAK_MAX = 2;
+static const uint32_t DEVICE_CERT_VALIDATION_INTERVAL_MS = 30000;
+static const uint8_t DEVICE_CERT_INVALID_STREAK_MAX = 4;
 
 // Provisioning state
 static bool g_provCertOk = false;
@@ -626,6 +657,7 @@ static String g_tlsKeyOwned;
 static const char* g_tlsRootCa = nullptr;
 static const char* g_tlsCert = nullptr;
 static const char* g_tlsKey = nullptr;
+static const size_t PROV_RX_MAX_BYTES = 12288U;
 
 static void applyTlsCommon() {
   // WiFiClientSecure expects seconds (not milliseconds).
@@ -649,6 +681,22 @@ static void ensureMqttPacketBuffer(size_t bytes) {
   Serial.printf("[MQTT] buffer size request=%u ok=%d\n",
                 (unsigned)bytes,
                 ok ? 1 : 0);
+}
+
+static size_t chooseProvisionMqttBufferSize() {
+#if defined(ARDUINO_ARCH_ESP32)
+  const uint32_t freeHeap = (uint32_t)ESP.getFreeHeap();
+  const uint32_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // Provisioning responses can be large, but some field devices operate in a
+  // tighter memory envelope during onboarding. Keep a smaller fallback buffer
+  // so provisioning can still start under moderate pressure.
+  if (freeHeap < 70000U || largest8 < 30000U) return 5120U;
+  if (freeHeap < 90000U || largest8 < 45000U) return 6144U;
+  if (freeHeap < 120000U || largest8 < 70000U) return 8192U;
+  return PROV_RX_MAX_BYTES;
+#else
+  return 6144U;
+#endif
 }
 
 static void recoverMqttTransport(const char* reason, bool requestTlsReload) {
@@ -708,6 +756,22 @@ static inline String cloudTopicCmd() {
 static inline String cloudTopicState() {
   return String(CLOUD_TOPIC_PREFIX) + "/" + getDeviceId6() + "/state";
 }
+static inline String cloudTopicHaCmdBase() {
+  return String(CLOUD_TOPIC_PREFIX) + "/" + getDeviceId6() + "/ha/cmd";
+}
+static inline String cloudTopicHaAvailability() {
+  return String(CLOUD_TOPIC_PREFIX) + "/" + getDeviceId6() + "/ha/availability";
+}
+static inline String homeAssistantStatusTopic() {
+  return String("homeassistant/status");
+}
+#if ENABLE_HA_LOCAL_MQTT
+static inline PubSubClient& haMqttClient() { return g_haMqtt; }
+static inline bool haMqttConnected() { return g_haMqtt.connected(); }
+#else
+static inline PubSubClient& haMqttClient() { return g_mqtt; }
+static inline bool haMqttConnected() { return g_mqtt.connected(); }
+#endif
 static inline String cloudThingNamePrimary();
 static inline String cloudTopicShadow() {
   return String(CLOUD_TOPIC_PREFIX) + "/" + getDeviceId6() + "/shadow";
@@ -724,6 +788,240 @@ static inline String cloudMqttClientId() {
 }
 static inline String claimMqttClientId() {
   return String("claim-") + getDeviceId6();
+}
+
+// Home Assistant discovery helper. We expose stable entity IDs per deviceId6 so
+// multi-device deployments can be auto-discovered without manual YAML edits.
+static String haEntityUniqueId(const char* suffix) {
+  String out = String(deviceProductSlug()) + "_" + getDeviceId6();
+  if (suffix && *suffix) {
+    out += "_";
+    out += suffix;
+  }
+  return out;
+}
+
+static String haDiscoveryTopic(const char* component, const char* suffix) {
+  return String("homeassistant/") + component + "/" + haEntityUniqueId(suffix) + "/config";
+}
+
+static void fillHaDeviceDescriptor(JsonObject devObj) {
+  JsonArray ids = devObj["ids"].to<JsonArray>();
+  ids.add(cloudThingNamePrimary());
+  ids.add(getDeviceId6());
+  devObj["name"] = String(deviceBrandName()) + " " + getDeviceId6();
+  devObj["mf"] = "AAC";
+  devObj["mdl"] = deviceBrandName();
+  devObj["sw"] = FW_VERSION;
+  devObj["hw"] = DEVICE_HW_REV;
+}
+
+static bool publishHaDiscoveryConfig(const char* component, const char* suffix, JsonDocument& cfg) {
+  const String topic = haDiscoveryTopic(component, suffix);
+  String payload;
+  serializeJson(cfg, payload);
+  PubSubClient& client = haMqttClient();
+  const bool ok = client.publish(topic.c_str(), payload.c_str(), true);
+  Serial.printf("[HA] discovery %s ok=%d topic=%s len=%u\n",
+                suffix,
+                ok ? 1 : 0,
+                topic.c_str(),
+                (unsigned)payload.length());
+  return ok;
+}
+
+static bool publishHomeAssistantDiscovery(bool force = false) {
+  if (!haMqttConnected()) return false;
+  const uint32_t now = millis();
+  if (!force && !g_haDiscoveryDirty &&
+      (uint32_t)(now - g_haDiscoveryLastPublishMs) < 300000UL) {
+    return true;
+  }
+
+  const String stateTopic = cloudTopicState();
+  const String availTopic = cloudTopicHaAvailability();
+  const String cmdBase = cloudTopicHaCmdBase();
+  bool okAll = true;
+
+  // Master power
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Master Power";
+    cfg["uniq_id"] = haEntityUniqueId("master");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/master";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.status.masterOn else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "master", cfg) && okAll;
+  }
+
+  // Clean
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Clean";
+    cfg["uniq_id"] = haEntityUniqueId("clean");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/clean";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.status.cleanOn else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "clean", cfg) && okAll;
+  }
+
+  // Ionizer
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Ionizer";
+    cfg["uniq_id"] = haEntityUniqueId("ion");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/ion";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.status.ionOn else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "ion", cfg) && okAll;
+  }
+
+  // Light relay
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Light";
+    cfg["uniq_id"] = haEntityUniqueId("light");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/light";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.status.lightOn else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "light", cfg) && okAll;
+  }
+
+  // Cloud enable/disable bridge
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Cloud Enabled";
+    cfg["uniq_id"] = haEntityUniqueId("cloud_enabled");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/cloud_enabled";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.cloud.enabled else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "cloud_enabled", cfg) && okAll;
+  }
+
+  // Fan percent
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Fan Percent";
+    cfg["uniq_id"] = haEntityUniqueId("fan_percent");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/fan_percent";
+    cfg["val_tpl"] = "{{ value_json.status.fanPercent | int(0) }}";
+    cfg["min"] = 0;
+    cfg["max"] = 100;
+    cfg["step"] = 1;
+    cfg["mode"] = "slider";
+    cfg["unit_of_meas"] = "%";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("number", "fan_percent", cfg) && okAll;
+  }
+
+  // Mode number for universal cross-model control (1..5 currently).
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Mode";
+    cfg["uniq_id"] = haEntityUniqueId("mode");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/mode";
+    cfg["val_tpl"] = "{{ value_json.status.mode | int(1) }}";
+    cfg["min"] = 1;
+    cfg["max"] = 5;
+    cfg["step"] = 1;
+    cfg["mode"] = "box";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("number", "mode", cfg) && okAll;
+  }
+
+  // Telemetry sensors
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Air Quality Score";
+    cfg["uniq_id"] = haEntityUniqueId("aq_score");
+    cfg["stat_t"] = stateTopic;
+    cfg["val_tpl"] = "{{ value_json.airQuality.score | default(0) }}";
+    cfg["icon"] = "mdi:air-filter";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("sensor", "aq_score", cfg) && okAll;
+  }
+
+  {
+    JsonDocument cfg;
+    cfg["name"] = "PM2.5";
+    cfg["uniq_id"] = haEntityUniqueId("pm25");
+    cfg["stat_t"] = stateTopic;
+    cfg["val_tpl"] = "{{ value_json.env.pm2_5 | default(0) }}";
+    cfg["unit_of_meas"] = "µg/m³";
+    cfg["dev_cla"] = "pm25";
+    cfg["stat_cla"] = "measurement";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("sensor", "pm25", cfg) && okAll;
+  }
+
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Cloud MQTT";
+    cfg["uniq_id"] = haEntityUniqueId("cloud_mqtt");
+    cfg["stat_t"] = stateTopic;
+    cfg["val_tpl"] = "{{ 'ON' if value_json.cloud.mqttConnected else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["dev_cla"] = "connectivity";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("binary_sensor", "cloud_mqtt", cfg) && okAll;
+  }
+
+  g_haDiscoveryLastPublishMs = now;
+  g_haDiscoveryDirty = !okAll;
+  if (okAll) {
+    Serial.printf("[HA] discovery published product=%s id6=%s\n",
+                  deviceProductSlug().c_str(),
+                  getDeviceId6().c_str());
+  }
+  return okAll;
 }
 static inline String cloudTopicShadowDeltaForThing(const String& thingName) {
   return String("$aws/things/") + thingName + "/shadow/update/delta";
@@ -1098,6 +1396,15 @@ static inline String provCreateAcceptedTopic() {
 static inline String provCreateRejectedTopic() {
   return String("$aws/certificates/create-from-csr/json/rejected");
 }
+static inline String provCreateKeysTopic() {
+  return String("$aws/certificates/create/json");
+}
+static inline String provCreateKeysAcceptedTopic() {
+  return String("$aws/certificates/create/json/accepted");
+}
+static inline String provCreateKeysRejectedTopic() {
+  return String("$aws/certificates/create/json/rejected");
+}
 static inline String provisioningTemplateName() {
   String configured = String(PROVISIONING_TEMPLATE_NAME);
   configured.trim();
@@ -1108,6 +1415,9 @@ static inline String provProvisionTopic() {
   return String("$aws/provisioning-templates/") +
          provisioningTemplateName() + "/provision/json";
 }
+static inline String provProvisionTopicForTemplate(const String& templateName) {
+  return String("$aws/provisioning-templates/") + templateName + "/provision/json";
+}
 static inline String provProvisionAcceptedTopic() {
   return String("$aws/provisioning-templates/") +
          provisioningTemplateName() + "/provision/json/accepted";
@@ -1115,6 +1425,40 @@ static inline String provProvisionAcceptedTopic() {
 static inline String provProvisionRejectedTopic() {
   return String("$aws/provisioning-templates/") +
          provisioningTemplateName() + "/provision/json/rejected";
+}
+static inline String provProvisionAcceptedAnyTopic() {
+  return String("$aws/provisioning-templates/+/provision/json/accepted");
+}
+static inline String provProvisionRejectedAnyTopic() {
+  return String("$aws/provisioning-templates/+/provision/json/rejected");
+}
+static bool isProvisionAcceptedTopic(const String& topic) {
+  return topic.startsWith("$aws/provisioning-templates/") &&
+         topic.endsWith("/provision/json/accepted");
+}
+static bool isProvisionRejectedTopic(const String& topic) {
+  return topic.startsWith("$aws/provisioning-templates/") &&
+         topic.endsWith("/provision/json/rejected");
+}
+static size_t collectProvisionTemplateNames(String* out, size_t cap) {
+  if (out == nullptr || cap == 0) return 0;
+  size_t n = 0;
+  auto pushUnique = [&](const String& name) {
+    String v = name;
+    v.trim();
+    if (!v.length()) return;
+    for (size_t i = 0; i < n; ++i) {
+      if (out[i] == v) return;
+    }
+    if (n < cap) out[n++] = v;
+  };
+  const String product = deviceProductSlug();
+  pushUnique(String(PROVISIONING_TEMPLATE_NAME));
+  pushUnique(product + String("-provisioning-template"));
+  pushUnique(product + String("-dev-fleet-provisioning"));
+  pushUnique(product + String("-prod-fleet-provisioning"));
+  pushUnique(product + String("-staging-fleet-provisioning"));
+  return n;
 }
 
 static int mbedtlsHardwareRng(void* ctx, unsigned char* out, size_t len) {
@@ -1242,7 +1586,8 @@ static bool spiffsFileContainsToken(const char* path, const char* token) {
 static bool deviceCertsValid() {
   const size_t certSz = spiffsFileSize(kDeviceCertPath);
   const size_t keySz = spiffsFileSize(kDeviceKeyPath);
-  if (certSz < 256 || keySz < 256) return false;
+  // EC private keys may be shorter than older RSA/PKCS8 payloads.
+  if (certSz < 256 || keySz < 128) return false;
   const bool certBegin = spiffsFileContainsToken(kDeviceCertPath, "-----BEGIN CERTIFICATE-----");
   const bool certEnd = spiffsFileContainsToken(kDeviceCertPath, "-----END CERTIFICATE-----");
   const bool keyBeginRsa = spiffsFileContainsToken(kDeviceKeyPath, "-----BEGIN RSA PRIVATE KEY-----");
@@ -1497,6 +1842,11 @@ static String buildShadowReportedJson() {
 static void cloudPublishState() {
   if (g_provisioningInProgress) return;
   if (!g_cloud.mqttConnected || !g_mqtt.connected()) return;
+  // Keep HA availability retained topic fresh for local dashboards.
+#if !ENABLE_HA_LOCAL_MQTT
+  (void)g_mqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+  (void)publishHomeAssistantDiscovery(false);
+#endif
   const String stateTopic = cloudTopicState();
   const String state = buildStatusJsonMin();
   Serial.printf("[MQTT] publish -> %s len=%u\n",
@@ -1524,6 +1874,7 @@ static void cloudPublishState() {
 
 static bool provisionIfNeeded() {
   ScopedPerfLog perfScope("provision_if_needed");
+  static uint32_t s_lastLowHeapLogMs = 0;
   const String endpoint = effectiveCloudEndpoint();
   if (isPlaceholderCloudEndpoint(endpoint)) {
     Serial.println("[PROV] enter provisionIfNeeded() reason=no_endpoint");
@@ -1542,6 +1893,10 @@ static bool provisionIfNeeded() {
     return false;
   }
   const uint32_t nowMs = millis();
+  if (g_provSuspendUntilMs != 0 &&
+      (int32_t)(g_provSuspendUntilMs - nowMs) > 0) {
+    return false;
+  }
   if (nowMs - g_provLastAttemptMs < g_provBackoffMs) {
     return false;
   }
@@ -1554,6 +1909,29 @@ static bool provisionIfNeeded() {
     Serial.println("[PROV] enter provisionIfNeeded() reason=no_wifi");
     return false;
   }
+  const wifi_mode_t wifiMode = WiFi.getMode();
+  const bool apUp = (wifiMode == WIFI_AP || wifiMode == WIFI_AP_STA);
+  if (apUp) {
+    Serial.println("[PROV] enter provisionIfNeeded() reason=ap_active");
+    return false;
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  const uint32_t freeHeap = (uint32_t)ESP.getFreeHeap();
+  const uint32_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // Hard floor: below this, TLS/provisioning attempts are unlikely to succeed.
+  // Keep this conservative, but lower than previous values so cloud onboarding
+  // is not permanently blocked on typical runtime memory levels.
+  if (freeHeap < 36000U || largest8 < 12000U) {
+    const uint32_t nowLogMs = millis();
+    if (s_lastLowHeapLogMs == 0 ||
+        (uint32_t)(nowLogMs - s_lastLowHeapLogMs) >= 5000U) {
+      Serial.printf("[PROV] enter provisionIfNeeded() reason=low_heap free=%u largest8=%u\n",
+                    freeHeap, largest8);
+      s_lastLowHeapLogMs = nowLogMs;
+    }
+    return false;
+  }
+#endif
 
   if (!ensureSpiffsReadyLogged("provision")) {
     Serial.println("[PROV] enter provisionIfNeeded() reason=spiffs_mount_failed");
@@ -1579,7 +1957,11 @@ static bool provisionIfNeeded() {
   if (g_mqttNet.connected()) {
     g_mqttNet.stop();
   }
-  ensureMqttPacketBuffer(8192);
+  const size_t provBuf = chooseProvisionMqttBufferSize();
+  Serial.printf("[PROV] mqtt buffer chosen=%u freeHeap=%u\n",
+                (unsigned)provBuf,
+                (unsigned)ESP.getFreeHeap());
+  ensureMqttPacketBuffer(provBuf);
 
   g_provisioningInProgress = true;
   g_provCertOk = g_provCertFail = g_provThingOk = g_provThingFail = false;
@@ -1654,10 +2036,14 @@ static bool provisionIfNeeded() {
   Serial.printf("[PROV] subscribe ok: %s -> %d\n", provCreateAcceptedTopic().c_str(), subAccepted ? 1 : 0);
   bool subRejected = g_mqtt.subscribe(provCreateRejectedTopic().c_str());
   Serial.printf("[PROV] subscribe ok: %s -> %d\n", provCreateRejectedTopic().c_str(), subRejected ? 1 : 0);
-  bool subProvisionAccept = g_mqtt.subscribe(provProvisionAcceptedTopic().c_str());
-  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provProvisionAcceptedTopic().c_str(), subProvisionAccept ? 1 : 0);
-  bool subProvisionReject = g_mqtt.subscribe(provProvisionRejectedTopic().c_str());
-  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provProvisionRejectedTopic().c_str(), subProvisionReject ? 1 : 0);
+  bool subCreateKeysAccepted = g_mqtt.subscribe(provCreateKeysAcceptedTopic().c_str());
+  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provCreateKeysAcceptedTopic().c_str(), subCreateKeysAccepted ? 1 : 0);
+  bool subCreateKeysRejected = g_mqtt.subscribe(provCreateKeysRejectedTopic().c_str());
+  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provCreateKeysRejectedTopic().c_str(), subCreateKeysRejected ? 1 : 0);
+  bool subProvisionAccept = g_mqtt.subscribe(provProvisionAcceptedAnyTopic().c_str());
+  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provProvisionAcceptedAnyTopic().c_str(), subProvisionAccept ? 1 : 0);
+  bool subProvisionReject = g_mqtt.subscribe(provProvisionRejectedAnyTopic().c_str());
+  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provProvisionRejectedAnyTopic().c_str(), subProvisionReject ? 1 : 0);
 
   Serial.println("[PROV] subscribed to provisioning topics");
   String csrPem;
@@ -1689,11 +2075,15 @@ static bool provisionIfNeeded() {
       if (g_mqtt.connect(clientId.c_str())) {
         const bool subAcceptedRetry = g_mqtt.subscribe(provCreateAcceptedTopic().c_str());
         const bool subRejectedRetry = g_mqtt.subscribe(provCreateRejectedTopic().c_str());
-        const bool subProvisionAcceptRetry = g_mqtt.subscribe(provProvisionAcceptedTopic().c_str());
-        const bool subProvisionRejectRetry = g_mqtt.subscribe(provProvisionRejectedTopic().c_str());
-        Serial.printf("[PROV] retry subscribe createAccepted=%d createRejected=%d provAccepted=%d provRejected=%d\n",
+        const bool subCreateKeysAcceptedRetry = g_mqtt.subscribe(provCreateKeysAcceptedTopic().c_str());
+        const bool subCreateKeysRejectedRetry = g_mqtt.subscribe(provCreateKeysRejectedTopic().c_str());
+        const bool subProvisionAcceptRetry = g_mqtt.subscribe(provProvisionAcceptedAnyTopic().c_str());
+        const bool subProvisionRejectRetry = g_mqtt.subscribe(provProvisionRejectedAnyTopic().c_str());
+        Serial.printf("[PROV] retry subscribe createAccepted=%d createRejected=%d createKeysAccepted=%d createKeysRejected=%d provAccepted=%d provRejected=%d\n",
                       subAcceptedRetry ? 1 : 0,
                       subRejectedRetry ? 1 : 0,
+                      subCreateKeysAcceptedRetry ? 1 : 0,
+                      subCreateKeysRejectedRetry ? 1 : 0,
                       subProvisionAcceptRetry ? 1 : 0,
                       subProvisionRejectRetry ? 1 : 0);
         pubCertCreate = g_mqtt.publish(createTopic.c_str(), createPayload.c_str(), false);
@@ -1707,12 +2097,91 @@ static bool provisionIfNeeded() {
       }
     }
   }
+  auto tryCreateWithAwsGeneratedKey = [&]() -> bool {
+    g_provCertOk = false;
+    g_provCertFail = false;
+    g_provErr = "";
+    g_newCertPem = "";
+    g_newCertId = "";
+    g_certOwnershipToken = "";
+    g_newPrivKey = "";
+    auto ensureProvisionSubscriptions = [&]() {
+      const bool subAcceptedRetry = g_mqtt.subscribe(provCreateAcceptedTopic().c_str());
+      const bool subRejectedRetry = g_mqtt.subscribe(provCreateRejectedTopic().c_str());
+      const bool subCreateKeysAcceptedRetry = g_mqtt.subscribe(provCreateKeysAcceptedTopic().c_str());
+      const bool subCreateKeysRejectedRetry = g_mqtt.subscribe(provCreateKeysRejectedTopic().c_str());
+      const bool subProvisionAcceptRetry = g_mqtt.subscribe(provProvisionAcceptedAnyTopic().c_str());
+      const bool subProvisionRejectRetry = g_mqtt.subscribe(provProvisionRejectedAnyTopic().c_str());
+      Serial.printf("[PROV] fallback subscribe createAccepted=%d createRejected=%d createKeysAccepted=%d createKeysRejected=%d provAccepted=%d provRejected=%d\n",
+                    subAcceptedRetry ? 1 : 0,
+                    subRejectedRetry ? 1 : 0,
+                    subCreateKeysAcceptedRetry ? 1 : 0,
+                    subCreateKeysRejectedRetry ? 1 : 0,
+                    subProvisionAcceptRetry ? 1 : 0,
+                    subProvisionRejectRetry ? 1 : 0);
+    };
+    auto ensureClaimMqttConnected = [&]() -> bool {
+      if (g_mqtt.connected()) return true;
+      Serial.println("[PROV] fallback reconnecting claim MQTT");
+      g_mqttNet.stop();
+      delay(120);
+      if (!g_mqtt.connect(clientId.c_str())) {
+        Serial.printf("[PROV] fallback reconnect failed state=%d\n", g_mqtt.state());
+        return false;
+      }
+      ensureProvisionSubscriptions();
+      return true;
+    };
+
+    const String createKeysTopic = provCreateKeysTopic();
+    if (!ensureClaimMqttConnected()) return false;
+    bool pub = g_mqtt.publish(createKeysTopic.c_str(), "{}", false);
+    if (!pub && !g_mqtt.connected() && ensureClaimMqttConnected()) {
+      pub = g_mqtt.publish(createKeysTopic.c_str(), "{}", false);
+    }
+    Serial.printf("[PROV] fallback publish: %s ok=%d state=%d\n",
+                  createKeysTopic.c_str(),
+                  pub ? 1 : 0,
+                  g_mqtt.state());
+    if (!pub) {
+      return false;
+    }
+  const uint32_t tFallback = millis();
+    while (!g_provCertOk && !g_provCertFail && (millis() - tFallback) < 10000) {
+      if (!g_mqtt.connected()) {
+        Serial.printf("[PROV] fallback wait aborted: mqtt disconnected state=%d\n",
+                      g_mqtt.state());
+        break;
+      }
+      g_mqtt.loop();
+      delay(10);
+    }
+    if (!g_provCertOk) {
+      Serial.printf("[PROV] fallback create/json failed err=%s state=%d\n",
+                    g_provErr.c_str(), g_mqtt.state());
+      return false;
+    }
+    Serial.printf("[PROV] fallback create/json accepted certId=%s keyLen=%u\n",
+                  g_newCertId.c_str(),
+                  (unsigned)g_newPrivKey.length());
+    return true;
+  };
+
   const uint32_t t0 = millis();
-  while (!g_provCertOk && !g_provCertFail && (millis() - t0) < 15000) {
+  while (!g_provCertOk && !g_provCertFail && (millis() - t0) < 8000) {
+    if (!g_mqtt.connected()) {
+      Serial.printf("[PROV] cert wait aborted: mqtt disconnected state=%d\n",
+                    g_mqtt.state());
+      break;
+    }
     g_mqtt.loop();
     delay(10);
   }
   if (!g_provCertOk) {
+    Serial.println("[PROV] CSR flow did not complete; trying create/json fallback");
+    if (tryCreateWithAwsGeneratedKey()) {
+      // continue provisioning with fallback cert + key
+    } else {
     char errBuf[128] = {0};
     const int tlsErr = g_mqttNet.lastError(errBuf, sizeof(errBuf));
     Serial.printf("[PROV] cert create failed: %s state=%d tlsErr=%d (%s) time=%lu\n",
@@ -1721,7 +2190,14 @@ static bool provisionIfNeeded() {
     g_provisioningInProgress = false;
     g_mqttNet.stop();
     g_provBackoffMs = min(PROV_RETRY_MAX_MS, g_provBackoffMs * 2);
+    g_provFailStreak = (uint8_t)min(255, (int)g_provFailStreak + 1);
+    if (g_provFailStreak >= 3) {
+      g_provSuspendUntilMs = millis() + 600000UL; // 10 min circuit breaker
+      Serial.println("[PROV] circuit breaker: suspending retries for 600s");
+      g_provFailStreak = 0;
+    }
     return false;
+    }
   }
 
   if (g_certOwnershipToken.isEmpty()) {
@@ -1735,20 +2211,43 @@ static bool provisionIfNeeded() {
   String payload =
       String("{\"certificateOwnershipToken\":\"") + g_certOwnershipToken +
       String("\",\"parameters\":{\"SerialNumber\":\"") + getDeviceId6() + "\"}}";
-  bool pubProvision = g_mqtt.publish(provProvisionTopic().c_str(), payload.c_str(), false);
-  Serial.printf("[PROV] publish: %s params={SerialNumber:%s} ok=%d\n",
-                provProvisionTopic().c_str(), getDeviceId6().c_str(), pubProvision ? 1 : 0);
-  if (!pubProvision) {
-    Serial.printf("[PROV] publish failed topic=%s state=%d\n",
-                  provProvisionTopic().c_str(), g_mqtt.state());
+  String templateNames[6];
+  const size_t templateCount = collectProvisionTemplateNames(templateNames, 6);
+  bool provisionOk = false;
+  for (size_t i = 0; i < templateCount; ++i) {
+    g_provThingOk = false;
+    g_provThingFail = false;
+    g_provErr = "";
+    const String provTopic = provProvisionTopicForTemplate(templateNames[i]);
+    bool pubProvision = g_mqtt.publish(provTopic.c_str(), payload.c_str(), false);
+    Serial.printf("[PROV] publish: %s params={SerialNumber:%s} ok=%d\n",
+                  provTopic.c_str(), getDeviceId6().c_str(), pubProvision ? 1 : 0);
+    if (!pubProvision) {
+      Serial.printf("[PROV] publish failed topic=%s state=%d\n",
+                    provTopic.c_str(), g_mqtt.state());
+      continue;
+    }
+    Serial.printf("[PROV] provision request SerialNumber=%s template=%s\n",
+                  getDeviceId6().c_str(), templateNames[i].c_str());
+    const uint32_t t1 = millis();
+    while (!g_provThingOk && !g_provThingFail && (millis() - t1) < 8000) {
+      if (!g_mqtt.connected()) {
+        Serial.printf("[PROV] provision wait aborted: mqtt disconnected state=%d template=%s\n",
+                      g_mqtt.state(),
+                      templateNames[i].c_str());
+        break;
+      }
+      g_mqtt.loop();
+      delay(10);
+    }
+    if (g_provThingOk) {
+      provisionOk = true;
+      break;
+    }
+    Serial.printf("[PROV] template attempt failed template=%s err=%s state=%d\n",
+                  templateNames[i].c_str(), g_provErr.c_str(), g_mqtt.state());
   }
-  Serial.printf("[PROV] provision request SerialNumber=%s\n", getDeviceId6().c_str());
-  const uint32_t t1 = millis();
-  while (!g_provThingOk && !g_provThingFail && (millis() - t1) < 15000) {
-    g_mqtt.loop();
-    delay(10);
-  }
-  if (!g_provThingOk) {
+  if (!provisionOk) {
     char errBuf[128] = {0};
     const int tlsErr = g_mqttNet.lastError(errBuf, sizeof(errBuf));
     Serial.printf("[PROV] provision failed: %s state=%d tlsErr=%d (%s) time=%lu\n",
@@ -1757,6 +2256,12 @@ static bool provisionIfNeeded() {
     g_provisioningInProgress = false;
     g_mqttNet.stop();
     g_provBackoffMs = min(PROV_RETRY_MAX_MS, g_provBackoffMs * 2);
+    g_provFailStreak = (uint8_t)min(255, (int)g_provFailStreak + 1);
+    if (g_provFailStreak >= 3) {
+      g_provSuspendUntilMs = millis() + 600000UL; // 10 min circuit breaker
+      Serial.println("[PROV] circuit breaker: suspending retries for 600s");
+      g_provFailStreak = 0;
+    }
     return false;
   }
 
@@ -1777,6 +2282,8 @@ static bool provisionIfNeeded() {
   g_provisioned = true;
   g_tlsConfigured = false;
   g_provBackoffMs = PROV_RETRY_MS;
+  g_provFailStreak = 0;
+  g_provSuspendUntilMs = 0;
   g_claimDeletePending = true;
   g_provisioningInProgress = false;
   g_deviceCertInvalidStreak = 0;
@@ -1814,7 +2321,13 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
 
   const String t = String(topic ? topic : "");
   if (g_provisioningInProgress) {
-    if (length == 0 || length > 8192) return;
+    if (length == 0 || length > PROV_RX_MAX_BYTES) {
+      Serial.printf("[PROV] drop payload len=%u max=%u topic=%s\n",
+                    (unsigned)length,
+                    (unsigned)PROV_RX_MAX_BYTES,
+                    t.c_str());
+      return;
+    }
     Serial.printf("[PROV] rx topic=%s len=%u\n", t.c_str(), (unsigned)length);
     String body;
     body.reserve(length + 1);
@@ -1824,28 +2337,48 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
       Serial.println("[PROV] JSON parse failed");
       return;
     }
-    if (t == provCreateAcceptedTopic()) {
+    if (t == provCreateAcceptedTopic() || t == provCreateKeysAcceptedTopic()) {
       g_newCertPem = doc["certificatePem"] | "";
       g_newCertId = doc["certificateId"] | "";
       g_certOwnershipToken = doc["certificateOwnershipToken"] | "";
-      Serial.printf("[PROV] create/accepted received: certId=%s tokenLen=%u\n",
+      if (t == provCreateKeysAcceptedTopic()) {
+        const String maybePrivateKey = doc["privateKey"] | "";
+        if (!maybePrivateKey.isEmpty()) {
+          g_newPrivKey = maybePrivateKey;
+        }
+      }
+      Serial.printf("[PROV] create accepted received: topic=%s certId=%s tokenLen=%u keyLen=%u\n",
+                    t.c_str(),
                     g_newCertId.c_str(),
-                    (unsigned)g_certOwnershipToken.length());
+                    (unsigned)g_certOwnershipToken.length(),
+                    (unsigned)g_newPrivKey.length());
       g_provCertOk = !g_newCertPem.isEmpty() && !g_newPrivKey.isEmpty() &&
                      !g_certOwnershipToken.isEmpty();
       return;
     }
-    if (t == provCreateRejectedTopic()) {
+    if (t == provCreateRejectedTopic() || t == provCreateKeysRejectedTopic()) {
       g_provCertFail = true;
-      g_provErr = doc["errorMessage"] | "create_rejected";
+      const String errMsg = doc["errorMessage"] | "";
+      const String errCode = doc["errorCode"] | "";
+      if (!errCode.isEmpty() && !errMsg.isEmpty()) {
+        g_provErr = errCode + String(":") + errMsg;
+      } else if (!errMsg.isEmpty()) {
+        g_provErr = errMsg;
+      } else if (!errCode.isEmpty()) {
+        g_provErr = errCode;
+      } else {
+        g_provErr = "create_rejected";
+      }
       const int previewLen = min(200, (int)body.length());
       String preview = body.substring(0, previewLen);
       if (body.length() > previewLen) preview += "...";
-      Serial.printf("[PROV] create/rejected received: err=%s payload=%s\n",
-                    g_provErr.c_str(), preview.c_str());
+      Serial.printf("[PROV] create rejected received: topic=%s err=%s payload=%s\n",
+                    t.c_str(),
+                    g_provErr.c_str(),
+                    preview.c_str());
       return;
     }
-    if (t == provProvisionAcceptedTopic()) {
+    if (isProvisionAcceptedTopic(t)) {
       g_provThingOk = true;
       const String thingName = doc["thingName"] | "";
       Serial.printf("[PROV] provision/accepted received: thingName=%s certId=%s\n",
@@ -1853,7 +2386,7 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
                     g_newCertId.c_str());
       return;
     }
-    if (t == provProvisionRejectedTopic()) {
+    if (isProvisionRejectedTopic(t)) {
       g_provThingFail = true;
       g_provErr = doc["errorMessage"] | "provision_rejected";
       const int previewLen = min(200, (int)body.length());
@@ -1863,6 +2396,99 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
                     g_provErr.c_str(), preview.c_str());
       return;
     }
+  }
+  const String haStatusTopic = homeAssistantStatusTopic();
+  if (t == haStatusTopic) {
+    if (length == 0 || length > 64) return;
+    String status;
+    status.reserve(length + 1);
+    for (unsigned int i = 0; i < length; ++i) {
+      status += (char)payload[i];
+    }
+    status.trim();
+    status.toLowerCase();
+    if (status == "online") {
+      Serial.println("[HA] homeassistant/status=online -> republish discovery");
+      g_haDiscoveryDirty = true;
+      (void)publishHomeAssistantDiscovery(true);
+      const bool okAvail = g_mqtt.publish(
+          cloudTopicHaAvailability().c_str(), "online", true);
+      Serial.printf("[HA] availability online publish ok=%d\n", okAvail ? 1 : 0);
+    }
+    return;
+  }
+
+  const String haCmdPrefix = cloudTopicHaCmdBase() + "/";
+  if (t.startsWith(haCmdPrefix)) {
+    if (length == 0 || length > 1024) {
+      Serial.printf("[HA] drop cmd payload size=%u topic=%s\n",
+                    (unsigned)length, t.c_str());
+      return;
+    }
+    String cmdPayload;
+    cmdPayload.reserve(length + 1);
+    for (unsigned int i = 0; i < length; ++i) {
+      cmdPayload += (char)payload[i];
+    }
+    cmdPayload.trim();
+    const String key = t.substring(haCmdPrefix.length());
+    JsonDocument cmdDoc;
+    bool handled = false;
+
+    if (key == "json") {
+      if (!deserializeJson(cmdDoc, cmdPayload)) {
+        handled = true;
+      } else {
+        Serial.println("[HA] json command parse failed");
+        return;
+      }
+    } else {
+      JsonObject root = cmdDoc.to<JsonObject>();
+      if (key == "master") {
+        root["masterOn"] = parseBoolLoose(cmdPayload, false);
+        handled = true;
+      } else if (key == "clean") {
+        root["cleanOn"] = parseBoolLoose(cmdPayload, false);
+        handled = true;
+      } else if (key == "ion") {
+        root["ionOn"] = parseBoolLoose(cmdPayload, false);
+        handled = true;
+      } else if (key == "light") {
+        root["lightOn"] = parseBoolLoose(cmdPayload, false);
+        handled = true;
+      } else if (key == "fan_percent") {
+        int v = cmdPayload.toInt();
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        root["fanPercent"] = v;
+        handled = true;
+      } else if (key == "mode") {
+        int mode = cmdPayload.toInt();
+        if (mode < 1) mode = 1;
+        if (mode > 5) mode = 5;
+        root["mode"] = mode;
+        handled = true;
+      } else if (key == "cloud_enabled") {
+        const bool enabled = parseBoolLoose(cmdPayload, false);
+        JsonObject cloud = root["cloud"].to<JsonObject>();
+        cloud["enabled"] = enabled;
+        if (enabled) {
+          const String endpoint = effectiveCloudEndpoint();
+          cloud["endpoint"] = endpoint;
+          cloud["iotEndpoint"] = endpoint;
+        }
+        handled = true;
+      }
+    }
+
+    if (!handled) {
+      Serial.printf("[HA] unsupported cmd topic=%s payload=%s\n",
+                    t.c_str(), cmdPayload.c_str());
+      return;
+    }
+    Serial.printf("[HA] cmd topic=%s payload=%s\n", t.c_str(), cmdPayload.c_str());
+    (void)handleIncomingControlJson(cmdDoc, CmdSource::MQTT, "HA_CMD", false, nullptr);
+    return;
   }
   const bool isCmdTopic = t.endsWith("/cmd");
   const bool isDeltaTopic = isShadowDeltaTopic(t);
@@ -2089,18 +2715,27 @@ static inline void cloudLoop(uint32_t) {
   static bool s_mqttCmdSubscribed = false;
   static bool s_mqttShadowSubscribed = false;
   static bool s_mqttJobsSubscribed = false;
+  static bool s_mqttHaCmdSubscribed = false;
+  static bool s_mqttHaStatusSubscribed = false;
   static bool s_mqttWasConnected = false;
   const String endpoint = effectiveCloudEndpoint();
   ensureMqttServerConfigured(endpoint);
   g_cloud.iotEndpoint = endpoint;
   g_cloud.enabled = (ENABLE_CLOUD != 0) && g_cloudUserEnabled;
   if (!g_cloud.enabled) {
-    if (g_mqtt.connected()) g_mqtt.disconnect();
+    if (g_mqtt.connected()) {
+#if !ENABLE_HA_LOCAL_MQTT
+      (void)g_mqtt.publish(cloudTopicHaAvailability().c_str(), "offline", true);
+#endif
+      g_mqtt.disconnect();
+    }
     g_cloud.mqttConnected = false;
     g_cloud.linked = false;
     s_mqttCmdSubscribed = false;
     s_mqttShadowSubscribed = false;
     s_mqttJobsSubscribed = false;
+    s_mqttHaCmdSubscribed = false;
+    s_mqttHaStatusSubscribed = false;
     s_mqttWasConnected = false;
     g_mqttBackoffMs = MQTT_RECONNECT_MS;
     g_mqttTlsFailStreak = 0;
@@ -2116,7 +2751,12 @@ static inline void cloudLoop(uint32_t) {
   if (WiFi.status() != WL_CONNECTED) {
     g_cloud.mqttConnected = false;
     setCloudState(CloudState::DEGRADED, "no wifi");
-    if (g_mqtt.connected()) g_mqtt.disconnect();
+    if (g_mqtt.connected()) {
+#if !ENABLE_HA_LOCAL_MQTT
+      (void)g_mqtt.publish(cloudTopicHaAvailability().c_str(), "offline", true);
+#endif
+      g_mqtt.disconnect();
+    }
     if (s_mqttWasConnected) {
       Serial.printf("[MQTT] disconnected state=%d\n", g_mqtt.state());
       char errBuf[128] = {0};
@@ -2129,6 +2769,8 @@ static inline void cloudLoop(uint32_t) {
     s_mqttCmdSubscribed = false;
     s_mqttShadowSubscribed = false;
     s_mqttJobsSubscribed = false;
+    s_mqttHaCmdSubscribed = false;
+    s_mqttHaStatusSubscribed = false;
     g_mqttBackoffMs = MQTT_RECONNECT_MS;
     g_mqttTlsFailStreak = 0;
     g_mqttConnectFailStreak = 0;
@@ -2156,6 +2798,15 @@ static inline void cloudLoop(uint32_t) {
       if (certsOk) {
         g_deviceCertInvalidStreak = 0;
       } else {
+        // If the device is already connected to MQTT with configured TLS,
+        // avoid destructive cert churn on transient SPIFFS read/parse hiccups.
+        if (g_tlsConfigured && g_mqtt.connected() && g_cloud.mqttConnected) {
+          Serial.println("[PROV] cert validation failed but MQTT is connected; deferring re-provision");
+          g_deviceCertInvalidStreak = 0;
+          g_nextDeviceCertValidationMs =
+              nowMs + (DEVICE_CERT_VALIDATION_INTERVAL_MS * 4UL);
+          return;
+        }
         if (g_deviceCertInvalidStreak < 255) {
           g_deviceCertInvalidStreak++;
         }
@@ -2252,6 +2903,8 @@ static inline void cloudLoop(uint32_t) {
     s_mqttCmdSubscribed = false;
     s_mqttShadowSubscribed = false;
     s_mqttJobsSubscribed = false;
+    s_mqttHaCmdSubscribed = false;
+    s_mqttHaStatusSubscribed = false;
 #if ENABLE_IR_RX_DEBUG
     // If IR edges are queued, prioritize draining them before a potentially
     // blocking TLS/MQTT connect attempt.
@@ -2332,7 +2985,13 @@ static inline void cloudLoop(uint32_t) {
 
     // 3) MQTT CONNECT + net/state log
     const uint32_t mqttConnectStartUs = micros();
-    bool ok = g_mqtt.connect(clientId.c_str());
+    const String haAvailTopic = cloudTopicHaAvailability();
+    bool ok = g_mqtt.connect(
+        clientId.c_str(),
+        haAvailTopic.c_str(),
+        1,
+        true,
+        "offline");
     Serial.printf("[MQTT] connect elapsed_us=%u\n", (uint32_t)(micros() - mqttConnectStartUs));
     Serial.printf("[MQTT] connect ok=%d state=%d net.connected=%d\n",
                   ok ? 1 : 0, g_mqtt.state(), g_mqttNet.connected() ? 1 : 0);
@@ -2395,6 +3054,26 @@ static inline void cloudLoop(uint32_t) {
         }
         s_mqttJobsSubscribed = anyOk;
       }
+#if !ENABLE_HA_LOCAL_MQTT
+      if (!s_mqttHaCmdSubscribed) {
+        const String haPrefix = cloudTopicHaCmdBase() + "/#";
+        const bool okHaCmd = g_mqtt.subscribe(haPrefix.c_str());
+        Serial.printf("[HA] subscribe cmd ok=%d topic=%s\n",
+                      okHaCmd ? 1 : 0, haPrefix.c_str());
+        s_mqttHaCmdSubscribed = okHaCmd;
+      }
+      if (!s_mqttHaStatusSubscribed) {
+        const String haStatus = homeAssistantStatusTopic();
+        const bool okHaStatus = g_mqtt.subscribe(haStatus.c_str());
+        Serial.printf("[HA] subscribe status ok=%d topic=%s\n",
+                      okHaStatus ? 1 : 0, haStatus.c_str());
+        s_mqttHaStatusSubscribed = okHaStatus;
+      }
+      const bool okAvail = g_mqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+      Serial.printf("[HA] availability online publish ok=%d\n", okAvail ? 1 : 0);
+      g_haDiscoveryDirty = true;
+      (void)publishHomeAssistantDiscovery(true);
+#endif
       if (g_claimDeletePending) {
         Serial.println("[PROV] deleting claim cert/key after device connect");
         spiffsRemoveIfExists(kClaimCertPath);
@@ -2484,12 +3163,116 @@ static inline void cloudLoop(uint32_t) {
     }
     s_mqttJobsSubscribed = anyOk;
   }
+#if !ENABLE_HA_LOCAL_MQTT
+  if (!s_mqttHaCmdSubscribed) {
+    const String haPrefix = cloudTopicHaCmdBase() + "/#";
+    const bool okHaCmd = g_mqtt.subscribe(haPrefix.c_str());
+    Serial.printf("[HA] subscribe cmd ok=%d topic=%s\n",
+                  okHaCmd ? 1 : 0, haPrefix.c_str());
+    s_mqttHaCmdSubscribed = okHaCmd;
+  }
+  if (!s_mqttHaStatusSubscribed) {
+    const String haStatus = homeAssistantStatusTopic();
+    const bool okHaStatus = g_mqtt.subscribe(haStatus.c_str());
+    Serial.printf("[HA] subscribe status ok=%d topic=%s\n",
+                  okHaStatus ? 1 : 0, haStatus.c_str());
+    s_mqttHaStatusSubscribed = okHaStatus;
+  }
+  (void)g_mqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+  (void)publishHomeAssistantDiscovery(false);
+#endif
   g_mqtt.loop();
   const uint32_t nowMs = millis();
   if (g_cloudDirty || (nowMs - g_cloudLastPubMs) >= CLOUD_PUB_INTERVAL_MS) {
     cloudPublishState();
   }
 }
+
+#if ENABLE_HA_LOCAL_MQTT
+static inline void haLocalMqttLoop(uint32_t nowMs) {
+  const String host = String(HA_LOCAL_MQTT_HOST);
+  if (!host.length()) return;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (g_haMqtt.connected()) g_haMqtt.disconnect();
+    g_haMqttSubscribed = false;
+    g_haMqttBackoffMs = 3000;
+    return;
+  }
+
+  g_haMqtt.setServer(host.c_str(), HA_LOCAL_MQTT_PORT);
+  g_haMqtt.setCallback(onMqttMessage);
+
+  if (!g_haMqtt.connected()) {
+    g_haMqttSubscribed = false;
+    if ((uint32_t)(nowMs - g_haMqttLastAttemptMs) < g_haMqttBackoffMs) {
+      return;
+    }
+    g_haMqttLastAttemptMs = nowMs;
+    const String clientId = String("ha-") + getDeviceId6();
+    const String availTopic = cloudTopicHaAvailability();
+    bool ok = false;
+    if (strlen(HA_LOCAL_MQTT_USER) > 0) {
+      ok = g_haMqtt.connect(
+          clientId.c_str(),
+          HA_LOCAL_MQTT_USER,
+          HA_LOCAL_MQTT_PASS,
+          availTopic.c_str(),
+          1,
+          true,
+          "offline");
+    } else {
+      ok = g_haMqtt.connect(
+          clientId.c_str(),
+          availTopic.c_str(),
+          1,
+          true,
+          "offline");
+    }
+    Serial.printf("[HA] local mqtt connect host=%s:%u ok=%d state=%d\n",
+                  host.c_str(),
+                  (unsigned)HA_LOCAL_MQTT_PORT,
+                  ok ? 1 : 0,
+                  g_haMqtt.state());
+    if (!ok) {
+      g_haMqttBackoffMs = min(HA_MQTT_RECONNECT_MAX_MS, g_haMqttBackoffMs * 2);
+      return;
+    }
+    g_haMqttBackoffMs = 3000;
+  }
+
+  if (!g_haMqttSubscribed) {
+    const String haCmd = cloudTopicHaCmdBase() + "/#";
+    const String haStatus = homeAssistantStatusTopic();
+    const bool okCmd = g_haMqtt.subscribe(haCmd.c_str());
+    const bool okStatus = g_haMqtt.subscribe(haStatus.c_str());
+    Serial.printf("[HA] local subscribe cmd=%d status=%d\n",
+                  okCmd ? 1 : 0, okStatus ? 1 : 0);
+    g_haMqttSubscribed = okCmd && okStatus;
+    (void)g_haMqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+    g_haDiscoveryDirty = true;
+    (void)publishHomeAssistantDiscovery(true);
+  }
+
+  const uint32_t pubIntervalMs = CLOUD_PUB_INTERVAL_MS;
+  if (g_cloudDirty || (uint32_t)(nowMs - g_haLastPubMs) >= pubIntervalMs) {
+    const String stateTopic = cloudTopicState();
+    const String state = buildStatusJsonMin();
+    const bool okState = g_haMqtt.publish(stateTopic.c_str(), state.c_str(), true);
+    if (okState) {
+      g_haLastPubMs = nowMs;
+      (void)g_haMqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+      (void)publishHomeAssistantDiscovery(false);
+    } else {
+      Serial.printf("[HA] local state publish failed topic=%s state=%d\n",
+                    stateTopic.c_str(),
+                    g_haMqtt.state());
+    }
+  }
+
+  g_haMqtt.loop();
+}
+#endif
 
 #if ENABLE_WAQI
 /* =================== WAQI (World Air Quality Index) =================== */
@@ -6442,6 +7225,15 @@ static inline bool primaryTransportAvailable() {
 }
 
 static inline bool recoveryTransportsAllowed(uint32_t nowMs) {
+  // Never suppress recovery transports while an active BLE session/provision
+  // hold is in effect. Otherwise BLE can be dropped in the middle of Wi-Fi
+  // onboarding before the app receives STA IP / mDNS handoff details.
+  if (g_blePolicyHoldUntilMs != 0 &&
+      (int32_t)(g_blePolicyHoldUntilMs - nowMs) > 0) {
+    g_recoverySuppressed = false;
+    g_recoveryDeferSinceMs = 0;
+    return true;
+  }
   // IR-first model:
   // - Unowned devices stay locked until an explicit pairing/recovery window is opened.
   // - Owned devices without STA creds can still use recovery transports.
@@ -14076,6 +14868,10 @@ void loop() {
   maybeRetryStaConnect(now);
   g_loopPhase = "cloud";
   cloudLoop(now);
+#if ENABLE_HA_LOCAL_MQTT
+  g_loopPhase = "ha_local";
+  haLocalMqttLoop(now);
+#endif
   g_loopPhase = "ota_pending";
   handlePendingOtaDecision();
   g_loopPhase = "conn";

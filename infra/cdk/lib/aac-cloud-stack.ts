@@ -23,17 +23,26 @@ export class AacCloudStack extends cdk.Stack {
 
     const iotDataEndpointParam = new cdk.CfnParameter(this, "IotDataEndpoint", {
       type: "String",
-      description: "AWS IoT Data endpoint (ats). Example: <prefix>-ats.iot.<region>.amazonaws.com",
+      description:
+        "AWS IoT Data endpoint (ats). Example: <prefix>-ats.iot.<region>.amazonaws.com",
     });
-    const provisioningRoleArnParam = new cdk.CfnParameter(this, "ProvisioningRoleArn", {
-      type: "String",
-      description: "IAM role ARN used by IoT Fleet Provisioning template.",
-    });
-    const callbackUrlsParam = new cdk.CfnParameter(this, "CognitoCallbackUrls", {
-      type: "CommaDelimitedList",
-      description: "Allowed callback URLs for Cognito App Client.",
-      default: "com.koray.artaircleaner://callback",
-    });
+    const provisioningRoleArnParam = new cdk.CfnParameter(
+      this,
+      "ProvisioningRoleArn",
+      {
+        type: "String",
+        description: "IAM role ARN used by IoT Fleet Provisioning template.",
+      },
+    );
+    const callbackUrlsParam = new cdk.CfnParameter(
+      this,
+      "CognitoCallbackUrls",
+      {
+        type: "CommaDelimitedList",
+        description: "Allowed callback URLs for Cognito App Client.",
+        default: "com.koray.artaircleaner://callback",
+      },
+    );
     const signoutUrlsParam = new cdk.CfnParameter(this, "CognitoSignoutUrls", {
       type: "CommaDelimitedList",
       description: "Allowed signout URLs for Cognito App Client.",
@@ -49,7 +58,10 @@ export class AacCloudStack extends cdk.Stack {
     });
     ownershipTable.addGlobalSecondaryIndex({
       indexName: "byOwnerUserId",
-      partitionKey: { name: "ownerUserId", type: dynamodb.AttributeType.STRING },
+      partitionKey: {
+        name: "ownerUserId",
+        type: dynamodb.AttributeType.STRING,
+      },
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
@@ -91,15 +103,22 @@ export class AacCloudStack extends cdk.Stack {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
-    const integrationLinksTable = new dynamodb.Table(this, "IntegrationLinksTable", {
-      tableName: `${prefix}-integration-links`,
-      partitionKey: { name: "integrationId", type: dynamodb.AttributeType.STRING },
-      sortKey: { name: "deviceId", type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-      timeToLiveAttribute: "expiresAt",
-    });
+    const integrationLinksTable = new dynamodb.Table(
+      this,
+      "IntegrationLinksTable",
+      {
+        tableName: `${prefix}-integration-links`,
+        partitionKey: {
+          name: "integrationId",
+          type: dynamodb.AttributeType.STRING,
+        },
+        sortKey: { name: "deviceId", type: dynamodb.AttributeType.STRING },
+        billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+        pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+        timeToLiveAttribute: "expiresAt",
+      },
+    );
     integrationLinksTable.addGlobalSecondaryIndex({
       indexName: "byDeviceId",
       partitionKey: { name: "deviceId", type: dynamodb.AttributeType.STRING },
@@ -107,13 +126,17 @@ export class AacCloudStack extends cdk.Stack {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
-    const cmdIdempotencyTable = new dynamodb.Table(this, "CmdIdempotencyTable", {
-      tableName: `${prefix}-cmd-idempotency`,
-      partitionKey: { name: "cmdKey", type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-      timeToLiveAttribute: "expiresAt",
-    });
+    const cmdIdempotencyTable = new dynamodb.Table(
+      this,
+      "CmdIdempotencyTable",
+      {
+        tableName: `${prefix}-cmd-idempotency`,
+        partitionKey: { name: "cmdKey", type: dynamodb.AttributeType.STRING },
+        billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+        timeToLiveAttribute: "expiresAt",
+      },
+    );
 
     const auditTable = new dynamodb.Table(this, "AuditTable", {
       tableName: `${prefix}-audit`,
@@ -220,7 +243,9 @@ export class AacCloudStack extends cdk.Stack {
       handler: "aac-cloud-api.handler",
       timeout: cdk.Duration.seconds(29),
       memorySize: 512,
-      code: lambda.Code.fromAsset(path.join(__dirname, "../../../../scripts/aws")),
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../../../scripts/aws"),
+      ),
       environment: {
         OWNERSHIP_TABLE: ownershipTable.tableName,
         STATE_TABLE: stateTable.tableName,
@@ -264,11 +289,7 @@ export class AacCloudStack extends cdk.Stack {
     lambdaFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "IotDataPlane",
-        actions: [
-          "iot:Publish",
-          "iot:GetThingShadow",
-          "iot:UpdateThingShadow",
-        ],
+        actions: ["iot:Publish", "iot:GetThingShadow", "iot:UpdateThingShadow"],
         resources: [
           `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/aac/*/cmd`,
           `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:thing/aac-*`,
@@ -279,7 +300,12 @@ export class AacCloudStack extends cdk.Stack {
     lambdaFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "IotJobsControlPlane",
-        actions: ["iot:CreateJob", "iot:DescribeJob", "iot:CancelJob", "iot:DescribeThing"],
+        actions: [
+          "iot:CreateJob",
+          "iot:DescribeJob",
+          "iot:CancelJob",
+          "iot:DescribeThing",
+        ],
         resources: [
           `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:job/*`,
           `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:thing/aac-*`,
@@ -292,16 +318,27 @@ export class AacCloudStack extends cdk.Stack {
       apiName: `${prefix}-http-api`,
       corsPreflight: {
         allowHeaders: ["authorization", "content-type"],
-        allowMethods: [apigwv2.CorsHttpMethod.GET, apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.OPTIONS],
+        allowMethods: [
+          apigwv2.CorsHttpMethod.GET,
+          apigwv2.CorsHttpMethod.POST,
+          apigwv2.CorsHttpMethod.OPTIONS,
+        ],
         allowOrigins: ["*"],
         maxAge: cdk.Duration.days(7),
       },
     });
 
-    const integration = new apigwv2Integrations.HttpLambdaIntegration("CloudApiIntegration", lambdaFn);
-    const jwtAuthorizer = new apigwv2Auth.HttpJwtAuthorizer("JwtAuth", userPool.userPoolProviderUrl, {
-      jwtAudience: [appClient.userPoolClientId],
-    });
+    const integration = new apigwv2Integrations.HttpLambdaIntegration(
+      "CloudApiIntegration",
+      lambdaFn,
+    );
+    const jwtAuthorizer = new apigwv2Auth.HttpJwtAuthorizer(
+      "JwtAuth",
+      userPool.userPoolProviderUrl,
+      {
+        jwtAudience: [appClient.userPoolClientId],
+      },
+    );
 
     httpApi.addRoutes({
       path: "/health",
@@ -314,31 +351,56 @@ export class AacCloudStack extends cdk.Stack {
       integration,
     });
 
-    const authedRoutes: Array<{ path: string; methods: apigwv2.HttpMethod[] }> = [
-      { path: "/me", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/me/invites", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/devices", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/device/{id6}/claim", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/name", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/claim/recover", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/claim-proof/sync", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/capabilities", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/device/{id6}/ha/config", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/device/{id6}/state", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/device/{id6}/cmd", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/desired", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/ota/job", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/invite", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/invites", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/device/{id6}/members", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/device/{id6}/acl/push", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/integration/link", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/integrations", methods: [apigwv2.HttpMethod.GET] },
-      { path: "/device/{id6}/integration/{integrationId}/revoke", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/invite/{inviteId}/revoke", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/member/{userSub}/revoke", methods: [apigwv2.HttpMethod.POST] },
-      { path: "/device/{id6}/unclaim", methods: [apigwv2.HttpMethod.POST] },
-    ];
+    const authedRoutes: Array<{ path: string; methods: apigwv2.HttpMethod[] }> =
+      [
+        { path: "/me", methods: [apigwv2.HttpMethod.GET] },
+        { path: "/me/invites", methods: [apigwv2.HttpMethod.GET] },
+        { path: "/devices", methods: [apigwv2.HttpMethod.GET] },
+        { path: "/device/{id6}/claim", methods: [apigwv2.HttpMethod.POST] },
+        { path: "/device/{id6}/name", methods: [apigwv2.HttpMethod.POST] },
+        {
+          path: "/device/{id6}/claim/recover",
+          methods: [apigwv2.HttpMethod.POST],
+        },
+        {
+          path: "/device/{id6}/claim-proof/sync",
+          methods: [apigwv2.HttpMethod.POST],
+        },
+        {
+          path: "/device/{id6}/capabilities",
+          methods: [apigwv2.HttpMethod.GET],
+        },
+        { path: "/device/{id6}/ha/config", methods: [apigwv2.HttpMethod.GET] },
+        { path: "/device/{id6}/state", methods: [apigwv2.HttpMethod.GET] },
+        { path: "/device/{id6}/cmd", methods: [apigwv2.HttpMethod.POST] },
+        { path: "/device/{id6}/desired", methods: [apigwv2.HttpMethod.POST] },
+        { path: "/device/{id6}/ota/job", methods: [apigwv2.HttpMethod.POST] },
+        { path: "/device/{id6}/invite", methods: [apigwv2.HttpMethod.POST] },
+        { path: "/device/{id6}/invites", methods: [apigwv2.HttpMethod.GET] },
+        { path: "/device/{id6}/members", methods: [apigwv2.HttpMethod.GET] },
+        { path: "/device/{id6}/acl/push", methods: [apigwv2.HttpMethod.POST] },
+        {
+          path: "/device/{id6}/integration/link",
+          methods: [apigwv2.HttpMethod.POST],
+        },
+        {
+          path: "/device/{id6}/integrations",
+          methods: [apigwv2.HttpMethod.GET],
+        },
+        {
+          path: "/device/{id6}/integration/{integrationId}/revoke",
+          methods: [apigwv2.HttpMethod.POST],
+        },
+        {
+          path: "/device/{id6}/invite/{inviteId}/revoke",
+          methods: [apigwv2.HttpMethod.POST],
+        },
+        {
+          path: "/device/{id6}/member/{userSub}/revoke",
+          methods: [apigwv2.HttpMethod.POST],
+        },
+        { path: "/device/{id6}/unclaim", methods: [apigwv2.HttpMethod.POST] },
+      ];
     for (const r of authedRoutes) {
       httpApi.addRoutes({
         path: r.path,
@@ -347,6 +409,8 @@ export class AacCloudStack extends cdk.Stack {
         authorizer: jwtAuthorizer,
       });
     }
+
+    const fleetProvisioningTemplateName = `${prefix}-fleet-provisioning`;
 
     const claimPolicy = new iot.CfnPolicy(this, "ClaimCertPolicy", {
       policyName: `${prefix}-claim-cert`,
@@ -360,20 +424,35 @@ export class AacCloudStack extends cdk.Stack {
           },
           {
             Effect: "Allow",
-            Action: ["iot:Publish", "iot:Receive"],
+            Action: ["iot:Publish"],
             Resource: [
-              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/certificates/create/*`,
-              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/certificates/create-from-csr/*`,
-              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/provisioning-templates/*`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/certificates/create/json`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/certificates/create-from-csr/json`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/provisioning-templates/*/provision/json`,
             ],
           },
           {
             Effect: "Allow",
             Action: ["iot:Subscribe"],
             Resource: [
-              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/certificates/create/*`,
-              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/certificates/create-from-csr/*`,
-              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/provisioning-templates/*`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/certificates/create/json/accepted`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/certificates/create/json/rejected`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/certificates/create-from-csr/json/accepted`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/certificates/create-from-csr/json/rejected`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/provisioning-templates/*/provision/json/accepted`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topicfilter/$aws/provisioning-templates/*/provision/json/rejected`,
+            ],
+          },
+          {
+            Effect: "Allow",
+            Action: ["iot:Receive"],
+            Resource: [
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/certificates/create/json/accepted`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/certificates/create/json/rejected`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/certificates/create-from-csr/json/accepted`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/certificates/create-from-csr/json/rejected`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/provisioning-templates/*/provision/json/accepted`,
+              `arn:${cdk.Aws.PARTITION}:iot:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:topic/$aws/provisioning-templates/*/provision/json/rejected`,
             ],
           },
         ],
@@ -415,8 +494,9 @@ export class AacCloudStack extends cdk.Stack {
     new iot.CfnProvisioningTemplate(this, "FleetProvisioningTemplate", {
       enabled: true,
       provisioningRoleArn: provisioningRoleArnParam.valueAsString,
-      templateName: `${prefix}-fleet-provisioning`,
-      description: "Provision AAC thing/cert and attach least-privilege thing policy.",
+      templateName: fleetProvisioningTemplateName,
+      description:
+        "Provision AAC thing/cert and attach least-privilege thing policy.",
       templateBody: JSON.stringify({
         Parameters: {
           SerialNumber: { Type: "String" },
@@ -453,14 +533,24 @@ export class AacCloudStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, "HttpApiUrl", { value: httpApi.apiEndpoint });
-    new cdk.CfnOutput(this, "CognitoUserPoolId", { value: userPool.userPoolId });
-    new cdk.CfnOutput(this, "CognitoClientId", { value: appClient.userPoolClientId });
-    new cdk.CfnOutput(this, "CognitoIssuer", { value: userPool.userPoolProviderUrl });
+    new cdk.CfnOutput(this, "CognitoUserPoolId", {
+      value: userPool.userPoolId,
+    });
+    new cdk.CfnOutput(this, "CognitoClientId", {
+      value: appClient.userPoolClientId,
+    });
+    new cdk.CfnOutput(this, "CognitoIssuer", {
+      value: userPool.userPoolProviderUrl,
+    });
     new cdk.CfnOutput(this, "CognitoHostedDomainUrl", {
       value: `https://${userPoolDomain.domainName}.auth.${this.region}.amazoncognito.com`,
     });
     new cdk.CfnOutput(this, "OtaBucketName", { value: otaBucket.bucketName });
-    new cdk.CfnOutput(this, "ClaimPolicyName", { value: claimPolicy.policyName ?? "" });
-    new cdk.CfnOutput(this, "ThingPolicyName", { value: thingPolicy.policyName ?? "" });
+    new cdk.CfnOutput(this, "ClaimPolicyName", {
+      value: claimPolicy.policyName ?? "",
+    });
+    new cdk.CfnOutput(this, "ThingPolicyName", {
+      value: thingPolicy.policyName ?? "",
+    });
   }
 }

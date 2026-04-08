@@ -86,6 +86,19 @@ python3 scripts/production/generate_release_attestation.py \
   --output docs/audit/attestations/<fw-version>.json
 ```
 
+GitHub Actions üzerinden standart release checklist çalıştırma:
+
+```bash
+# Tag push ile otomatik
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
+
+# Manuel tetikleme (opsiyonel)
+gh workflow run "Release Checklist" \
+  -f firmware_env=esp32dev_board_legacy \
+  -f strict_prod=false
+```
+
 `strict-prod` artık şunları zorunlu kılar:
 - board-specific firmware env (`esp32dev_board_legacy` veya `esp32dev_board_aux`)
 - EC/P-256 device key
