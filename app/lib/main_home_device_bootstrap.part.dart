@@ -27,6 +27,21 @@ extension _HomeScreenDeviceBootstrapPart on _HomeScreenState {
       normalized = 'http://$normalized';
     }
     normalized = _normalizedStoredBaseForDevice(dev, normalized);
+    final autoBrand = resolveDeviceBrand(
+      firmwareProduct: state?.deviceProduct ?? deviceProductSlugFromAny(dev.id),
+      bleName: _bleCtrlDevice?.platformName ?? '',
+      baseUrl: normalized,
+      mdnsHost: dev.mdnsHost ?? '',
+      apSsid: '',
+      currentBrand: dev.brand,
+    ).brand.trim();
+    if (autoBrand.isNotEmpty && autoBrand != dev.brand) {
+      debugPrint('[BRAND] setActive auto-correct ${dev.brand} -> $autoBrand');
+      dev.brand = autoBrand;
+      if (existingIndex != -1) {
+        _devices[existingIndex].brand = autoBrand;
+      }
+    }
     if (nextId6 != null && nextId6.isNotEmpty) {
       final host = Uri.tryParse(normalized)?.host.trim().toLowerCase() ?? '';
       final isAp = host == '192.168.4.1';

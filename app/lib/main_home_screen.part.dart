@@ -30,8 +30,10 @@ class _HomeScreenState extends State<HomeScreen>
   DateTime? _lastLocalOkAt;
   DateTime? _lastMdnsFixAt;
   final Map<String, DateTime> _mdnsBgResolveAtByHost = {};
+  final Map<String, DateTime> _mdnsNoIpv4LogAtByHost = {};
   DateTime? _localDnsFailUntil;
   DateTime? _localUnreachableUntil;
+  DateTime? _localRateLimitedUntil;
   DateTime? _lastCloudOkAt;
   DateTime? _cloudFailUntil;
   DateTime? _cloudPreferUntil;

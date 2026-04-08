@@ -1882,6 +1882,20 @@ extension _HomeScreenCloudAuthTransportPart on _HomeScreenState {
       if (dev.brand.trim().isEmpty) {
         dev.brand = kDefaultDeviceBrand;
       }
+      final resolvedBrand = resolveDeviceBrand(
+        firmwareProduct: deviceProductSlugFromAny(dev.id),
+        bleName: '',
+        baseUrl: dev.baseUrl,
+        mdnsHost: dev.mdnsHost ?? '',
+        apSsid: '',
+        currentBrand: dev.brand,
+      ).brand.trim();
+      if (resolvedBrand.isNotEmpty && resolvedBrand != dev.brand) {
+        debugPrint(
+          '[BRAND] inventory auto-correct ${dev.id}: ${dev.brand} -> $resolvedBrand',
+        );
+        dev.brand = resolvedBrand;
+      }
       final canonical = canonicalizeDeviceId(dev.id);
       if (canonical != null && canonical.isNotEmpty) {
         dev.thingName ??= thingNameFromAny(canonical);

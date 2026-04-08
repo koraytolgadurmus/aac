@@ -167,6 +167,21 @@ Preferences prefs;
 #ifndef HTTP_DIAG_LOG
 #define HTTP_DIAG_LOG 0
 #endif
+#ifndef ENABLE_HA_LOCAL_MQTT
+#define ENABLE_HA_LOCAL_MQTT 0
+#endif
+#ifndef HA_LOCAL_MQTT_HOST
+#define HA_LOCAL_MQTT_HOST ""
+#endif
+#ifndef HA_LOCAL_MQTT_PORT
+#define HA_LOCAL_MQTT_PORT 1883
+#endif
+#ifndef HA_LOCAL_MQTT_USER
+#define HA_LOCAL_MQTT_USER ""
+#endif
+#ifndef HA_LOCAL_MQTT_PASS
+#define HA_LOCAL_MQTT_PASS ""
+#endif
 // ---- Forward declarations (local-safe) ----
 enum class CmdSource : uint8_t { UNKNOWN = 0, BLE = 1, HTTP = 2, TCP = 3, MQTT = 4 };
 static bool equalsIgnoreCaseStr(const String& a, const String& b);
@@ -529,6 +544,15 @@ static void setCloudState(CloudState next, const char* reason = nullptr) {
 static WiFiClientSecure g_mqttNet;
 static PubSubClient g_mqtt(g_mqttNet);
 static String g_mqttServerHost;
+#if ENABLE_HA_LOCAL_MQTT
+static WiFiClient g_haMqttNet;
+static PubSubClient g_haMqtt(g_haMqttNet);
+static uint32_t g_haMqttLastAttemptMs = 0;
+static uint32_t g_haMqttBackoffMs = 3000;
+static const uint32_t HA_MQTT_RECONNECT_MAX_MS = 30000;
+static bool g_haMqttSubscribed = false;
+static uint32_t g_haLastPubMs = 0;
+#endif
 static uint32_t g_mqttLastAttemptMs = 0;
 static const uint32_t MQTT_RECONNECT_MS = 5000;
 static const uint32_t MQTT_RECONNECT_MAX_MS = 60000;
@@ -570,13 +594,15 @@ static bool g_provisioningInProgress = false;
 static bool g_tlsConfigured = false;
 static bool g_cloudUserEnabled = false;
 static bool g_claimDeletePending = false;
+static bool g_haDiscoveryDirty = true;
+static uint32_t g_haDiscoveryLastPublishMs = 0;
 static uint32_t g_nextDeviceCertValidationMs = 0;
 static uint8_t g_deviceCertInvalidStreak = 0;
 // Re-provision trigger latency was too long (60s * 3 ~= 3 min).
 // Keep a small debounce for transient FS hiccups but recover much faster
 // when device cert/key are genuinely missing.
-static const uint32_t DEVICE_CERT_VALIDATION_INTERVAL_MS = 15000;
-static const uint8_t DEVICE_CERT_INVALID_STREAK_MAX = 2;
+static const uint32_t DEVICE_CERT_VALIDATION_INTERVAL_MS = 30000;
+static const uint8_t DEVICE_CERT_INVALID_STREAK_MAX = 4;
 
 // Provisioning state
 static bool g_provCertOk = false;
@@ -730,6 +756,22 @@ static inline String cloudTopicCmd() {
 static inline String cloudTopicState() {
   return String(CLOUD_TOPIC_PREFIX) + "/" + getDeviceId6() + "/state";
 }
+static inline String cloudTopicHaCmdBase() {
+  return String(CLOUD_TOPIC_PREFIX) + "/" + getDeviceId6() + "/ha/cmd";
+}
+static inline String cloudTopicHaAvailability() {
+  return String(CLOUD_TOPIC_PREFIX) + "/" + getDeviceId6() + "/ha/availability";
+}
+static inline String homeAssistantStatusTopic() {
+  return String("homeassistant/status");
+}
+#if ENABLE_HA_LOCAL_MQTT
+static inline PubSubClient& haMqttClient() { return g_haMqtt; }
+static inline bool haMqttConnected() { return g_haMqtt.connected(); }
+#else
+static inline PubSubClient& haMqttClient() { return g_mqtt; }
+static inline bool haMqttConnected() { return g_mqtt.connected(); }
+#endif
 static inline String cloudThingNamePrimary();
 static inline String cloudTopicShadow() {
   return String(CLOUD_TOPIC_PREFIX) + "/" + getDeviceId6() + "/shadow";
@@ -746,6 +788,240 @@ static inline String cloudMqttClientId() {
 }
 static inline String claimMqttClientId() {
   return String("claim-") + getDeviceId6();
+}
+
+// Home Assistant discovery helper. We expose stable entity IDs per deviceId6 so
+// multi-device deployments can be auto-discovered without manual YAML edits.
+static String haEntityUniqueId(const char* suffix) {
+  String out = String(deviceProductSlug()) + "_" + getDeviceId6();
+  if (suffix && *suffix) {
+    out += "_";
+    out += suffix;
+  }
+  return out;
+}
+
+static String haDiscoveryTopic(const char* component, const char* suffix) {
+  return String("homeassistant/") + component + "/" + haEntityUniqueId(suffix) + "/config";
+}
+
+static void fillHaDeviceDescriptor(JsonObject devObj) {
+  JsonArray ids = devObj["ids"].to<JsonArray>();
+  ids.add(cloudThingNamePrimary());
+  ids.add(getDeviceId6());
+  devObj["name"] = String(deviceBrandName()) + " " + getDeviceId6();
+  devObj["mf"] = "AAC";
+  devObj["mdl"] = deviceBrandName();
+  devObj["sw"] = FW_VERSION;
+  devObj["hw"] = DEVICE_HW_REV;
+}
+
+static bool publishHaDiscoveryConfig(const char* component, const char* suffix, JsonDocument& cfg) {
+  const String topic = haDiscoveryTopic(component, suffix);
+  String payload;
+  serializeJson(cfg, payload);
+  PubSubClient& client = haMqttClient();
+  const bool ok = client.publish(topic.c_str(), payload.c_str(), true);
+  Serial.printf("[HA] discovery %s ok=%d topic=%s len=%u\n",
+                suffix,
+                ok ? 1 : 0,
+                topic.c_str(),
+                (unsigned)payload.length());
+  return ok;
+}
+
+static bool publishHomeAssistantDiscovery(bool force = false) {
+  if (!haMqttConnected()) return false;
+  const uint32_t now = millis();
+  if (!force && !g_haDiscoveryDirty &&
+      (uint32_t)(now - g_haDiscoveryLastPublishMs) < 300000UL) {
+    return true;
+  }
+
+  const String stateTopic = cloudTopicState();
+  const String availTopic = cloudTopicHaAvailability();
+  const String cmdBase = cloudTopicHaCmdBase();
+  bool okAll = true;
+
+  // Master power
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Master Power";
+    cfg["uniq_id"] = haEntityUniqueId("master");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/master";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.status.masterOn else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "master", cfg) && okAll;
+  }
+
+  // Clean
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Clean";
+    cfg["uniq_id"] = haEntityUniqueId("clean");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/clean";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.status.cleanOn else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "clean", cfg) && okAll;
+  }
+
+  // Ionizer
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Ionizer";
+    cfg["uniq_id"] = haEntityUniqueId("ion");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/ion";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.status.ionOn else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "ion", cfg) && okAll;
+  }
+
+  // Light relay
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Light";
+    cfg["uniq_id"] = haEntityUniqueId("light");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/light";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.status.lightOn else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "light", cfg) && okAll;
+  }
+
+  // Cloud enable/disable bridge
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Cloud Enabled";
+    cfg["uniq_id"] = haEntityUniqueId("cloud_enabled");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/cloud_enabled";
+    cfg["val_tpl"] = "{{ 'ON' if value_json.cloud.enabled else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("switch", "cloud_enabled", cfg) && okAll;
+  }
+
+  // Fan percent
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Fan Percent";
+    cfg["uniq_id"] = haEntityUniqueId("fan_percent");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/fan_percent";
+    cfg["val_tpl"] = "{{ value_json.status.fanPercent | int(0) }}";
+    cfg["min"] = 0;
+    cfg["max"] = 100;
+    cfg["step"] = 1;
+    cfg["mode"] = "slider";
+    cfg["unit_of_meas"] = "%";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("number", "fan_percent", cfg) && okAll;
+  }
+
+  // Mode number for universal cross-model control (1..5 currently).
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Mode";
+    cfg["uniq_id"] = haEntityUniqueId("mode");
+    cfg["stat_t"] = stateTopic;
+    cfg["cmd_t"] = cmdBase + "/mode";
+    cfg["val_tpl"] = "{{ value_json.status.mode | int(1) }}";
+    cfg["min"] = 1;
+    cfg["max"] = 5;
+    cfg["step"] = 1;
+    cfg["mode"] = "box";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("number", "mode", cfg) && okAll;
+  }
+
+  // Telemetry sensors
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Air Quality Score";
+    cfg["uniq_id"] = haEntityUniqueId("aq_score");
+    cfg["stat_t"] = stateTopic;
+    cfg["val_tpl"] = "{{ value_json.airQuality.score | default(0) }}";
+    cfg["icon"] = "mdi:air-filter";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("sensor", "aq_score", cfg) && okAll;
+  }
+
+  {
+    JsonDocument cfg;
+    cfg["name"] = "PM2.5";
+    cfg["uniq_id"] = haEntityUniqueId("pm25");
+    cfg["stat_t"] = stateTopic;
+    cfg["val_tpl"] = "{{ value_json.env.pm2_5 | default(0) }}";
+    cfg["unit_of_meas"] = "µg/m³";
+    cfg["dev_cla"] = "pm25";
+    cfg["stat_cla"] = "measurement";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("sensor", "pm25", cfg) && okAll;
+  }
+
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Cloud MQTT";
+    cfg["uniq_id"] = haEntityUniqueId("cloud_mqtt");
+    cfg["stat_t"] = stateTopic;
+    cfg["val_tpl"] = "{{ 'ON' if value_json.cloud.mqttConnected else 'OFF' }}";
+    cfg["pl_on"] = "ON";
+    cfg["pl_off"] = "OFF";
+    cfg["dev_cla"] = "connectivity";
+    cfg["avty_t"] = availTopic;
+    cfg["pl_avail"] = "online";
+    cfg["pl_not_avail"] = "offline";
+    fillHaDeviceDescriptor(cfg["dev"].to<JsonObject>());
+    okAll = publishHaDiscoveryConfig("binary_sensor", "cloud_mqtt", cfg) && okAll;
+  }
+
+  g_haDiscoveryLastPublishMs = now;
+  g_haDiscoveryDirty = !okAll;
+  if (okAll) {
+    Serial.printf("[HA] discovery published product=%s id6=%s\n",
+                  deviceProductSlug().c_str(),
+                  getDeviceId6().c_str());
+  }
+  return okAll;
 }
 static inline String cloudTopicShadowDeltaForThing(const String& thingName) {
   return String("$aws/things/") + thingName + "/shadow/update/delta";
@@ -1310,7 +1586,8 @@ static bool spiffsFileContainsToken(const char* path, const char* token) {
 static bool deviceCertsValid() {
   const size_t certSz = spiffsFileSize(kDeviceCertPath);
   const size_t keySz = spiffsFileSize(kDeviceKeyPath);
-  if (certSz < 256 || keySz < 256) return false;
+  // EC private keys may be shorter than older RSA/PKCS8 payloads.
+  if (certSz < 256 || keySz < 128) return false;
   const bool certBegin = spiffsFileContainsToken(kDeviceCertPath, "-----BEGIN CERTIFICATE-----");
   const bool certEnd = spiffsFileContainsToken(kDeviceCertPath, "-----END CERTIFICATE-----");
   const bool keyBeginRsa = spiffsFileContainsToken(kDeviceKeyPath, "-----BEGIN RSA PRIVATE KEY-----");
@@ -1565,6 +1842,11 @@ static String buildShadowReportedJson() {
 static void cloudPublishState() {
   if (g_provisioningInProgress) return;
   if (!g_cloud.mqttConnected || !g_mqtt.connected()) return;
+  // Keep HA availability retained topic fresh for local dashboards.
+#if !ENABLE_HA_LOCAL_MQTT
+  (void)g_mqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+  (void)publishHomeAssistantDiscovery(false);
+#endif
   const String stateTopic = cloudTopicState();
   const String state = buildStatusJsonMin();
   Serial.printf("[MQTT] publish -> %s len=%u\n",
@@ -2115,6 +2397,99 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
       return;
     }
   }
+  const String haStatusTopic = homeAssistantStatusTopic();
+  if (t == haStatusTopic) {
+    if (length == 0 || length > 64) return;
+    String status;
+    status.reserve(length + 1);
+    for (unsigned int i = 0; i < length; ++i) {
+      status += (char)payload[i];
+    }
+    status.trim();
+    status.toLowerCase();
+    if (status == "online") {
+      Serial.println("[HA] homeassistant/status=online -> republish discovery");
+      g_haDiscoveryDirty = true;
+      (void)publishHomeAssistantDiscovery(true);
+      const bool okAvail = g_mqtt.publish(
+          cloudTopicHaAvailability().c_str(), "online", true);
+      Serial.printf("[HA] availability online publish ok=%d\n", okAvail ? 1 : 0);
+    }
+    return;
+  }
+
+  const String haCmdPrefix = cloudTopicHaCmdBase() + "/";
+  if (t.startsWith(haCmdPrefix)) {
+    if (length == 0 || length > 1024) {
+      Serial.printf("[HA] drop cmd payload size=%u topic=%s\n",
+                    (unsigned)length, t.c_str());
+      return;
+    }
+    String cmdPayload;
+    cmdPayload.reserve(length + 1);
+    for (unsigned int i = 0; i < length; ++i) {
+      cmdPayload += (char)payload[i];
+    }
+    cmdPayload.trim();
+    const String key = t.substring(haCmdPrefix.length());
+    JsonDocument cmdDoc;
+    bool handled = false;
+
+    if (key == "json") {
+      if (!deserializeJson(cmdDoc, cmdPayload)) {
+        handled = true;
+      } else {
+        Serial.println("[HA] json command parse failed");
+        return;
+      }
+    } else {
+      JsonObject root = cmdDoc.to<JsonObject>();
+      if (key == "master") {
+        root["masterOn"] = parseBoolLoose(cmdPayload, false);
+        handled = true;
+      } else if (key == "clean") {
+        root["cleanOn"] = parseBoolLoose(cmdPayload, false);
+        handled = true;
+      } else if (key == "ion") {
+        root["ionOn"] = parseBoolLoose(cmdPayload, false);
+        handled = true;
+      } else if (key == "light") {
+        root["lightOn"] = parseBoolLoose(cmdPayload, false);
+        handled = true;
+      } else if (key == "fan_percent") {
+        int v = cmdPayload.toInt();
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        root["fanPercent"] = v;
+        handled = true;
+      } else if (key == "mode") {
+        int mode = cmdPayload.toInt();
+        if (mode < 1) mode = 1;
+        if (mode > 5) mode = 5;
+        root["mode"] = mode;
+        handled = true;
+      } else if (key == "cloud_enabled") {
+        const bool enabled = parseBoolLoose(cmdPayload, false);
+        JsonObject cloud = root["cloud"].to<JsonObject>();
+        cloud["enabled"] = enabled;
+        if (enabled) {
+          const String endpoint = effectiveCloudEndpoint();
+          cloud["endpoint"] = endpoint;
+          cloud["iotEndpoint"] = endpoint;
+        }
+        handled = true;
+      }
+    }
+
+    if (!handled) {
+      Serial.printf("[HA] unsupported cmd topic=%s payload=%s\n",
+                    t.c_str(), cmdPayload.c_str());
+      return;
+    }
+    Serial.printf("[HA] cmd topic=%s payload=%s\n", t.c_str(), cmdPayload.c_str());
+    (void)handleIncomingControlJson(cmdDoc, CmdSource::MQTT, "HA_CMD", false, nullptr);
+    return;
+  }
   const bool isCmdTopic = t.endsWith("/cmd");
   const bool isDeltaTopic = isShadowDeltaTopic(t);
   const bool isJobsNotifyNext = isJobsNotifyNextTopic(t);
@@ -2340,18 +2715,27 @@ static inline void cloudLoop(uint32_t) {
   static bool s_mqttCmdSubscribed = false;
   static bool s_mqttShadowSubscribed = false;
   static bool s_mqttJobsSubscribed = false;
+  static bool s_mqttHaCmdSubscribed = false;
+  static bool s_mqttHaStatusSubscribed = false;
   static bool s_mqttWasConnected = false;
   const String endpoint = effectiveCloudEndpoint();
   ensureMqttServerConfigured(endpoint);
   g_cloud.iotEndpoint = endpoint;
   g_cloud.enabled = (ENABLE_CLOUD != 0) && g_cloudUserEnabled;
   if (!g_cloud.enabled) {
-    if (g_mqtt.connected()) g_mqtt.disconnect();
+    if (g_mqtt.connected()) {
+#if !ENABLE_HA_LOCAL_MQTT
+      (void)g_mqtt.publish(cloudTopicHaAvailability().c_str(), "offline", true);
+#endif
+      g_mqtt.disconnect();
+    }
     g_cloud.mqttConnected = false;
     g_cloud.linked = false;
     s_mqttCmdSubscribed = false;
     s_mqttShadowSubscribed = false;
     s_mqttJobsSubscribed = false;
+    s_mqttHaCmdSubscribed = false;
+    s_mqttHaStatusSubscribed = false;
     s_mqttWasConnected = false;
     g_mqttBackoffMs = MQTT_RECONNECT_MS;
     g_mqttTlsFailStreak = 0;
@@ -2367,7 +2751,12 @@ static inline void cloudLoop(uint32_t) {
   if (WiFi.status() != WL_CONNECTED) {
     g_cloud.mqttConnected = false;
     setCloudState(CloudState::DEGRADED, "no wifi");
-    if (g_mqtt.connected()) g_mqtt.disconnect();
+    if (g_mqtt.connected()) {
+#if !ENABLE_HA_LOCAL_MQTT
+      (void)g_mqtt.publish(cloudTopicHaAvailability().c_str(), "offline", true);
+#endif
+      g_mqtt.disconnect();
+    }
     if (s_mqttWasConnected) {
       Serial.printf("[MQTT] disconnected state=%d\n", g_mqtt.state());
       char errBuf[128] = {0};
@@ -2380,6 +2769,8 @@ static inline void cloudLoop(uint32_t) {
     s_mqttCmdSubscribed = false;
     s_mqttShadowSubscribed = false;
     s_mqttJobsSubscribed = false;
+    s_mqttHaCmdSubscribed = false;
+    s_mqttHaStatusSubscribed = false;
     g_mqttBackoffMs = MQTT_RECONNECT_MS;
     g_mqttTlsFailStreak = 0;
     g_mqttConnectFailStreak = 0;
@@ -2407,6 +2798,15 @@ static inline void cloudLoop(uint32_t) {
       if (certsOk) {
         g_deviceCertInvalidStreak = 0;
       } else {
+        // If the device is already connected to MQTT with configured TLS,
+        // avoid destructive cert churn on transient SPIFFS read/parse hiccups.
+        if (g_tlsConfigured && g_mqtt.connected() && g_cloud.mqttConnected) {
+          Serial.println("[PROV] cert validation failed but MQTT is connected; deferring re-provision");
+          g_deviceCertInvalidStreak = 0;
+          g_nextDeviceCertValidationMs =
+              nowMs + (DEVICE_CERT_VALIDATION_INTERVAL_MS * 4UL);
+          return;
+        }
         if (g_deviceCertInvalidStreak < 255) {
           g_deviceCertInvalidStreak++;
         }
@@ -2503,6 +2903,8 @@ static inline void cloudLoop(uint32_t) {
     s_mqttCmdSubscribed = false;
     s_mqttShadowSubscribed = false;
     s_mqttJobsSubscribed = false;
+    s_mqttHaCmdSubscribed = false;
+    s_mqttHaStatusSubscribed = false;
 #if ENABLE_IR_RX_DEBUG
     // If IR edges are queued, prioritize draining them before a potentially
     // blocking TLS/MQTT connect attempt.
@@ -2583,7 +2985,13 @@ static inline void cloudLoop(uint32_t) {
 
     // 3) MQTT CONNECT + net/state log
     const uint32_t mqttConnectStartUs = micros();
-    bool ok = g_mqtt.connect(clientId.c_str());
+    const String haAvailTopic = cloudTopicHaAvailability();
+    bool ok = g_mqtt.connect(
+        clientId.c_str(),
+        haAvailTopic.c_str(),
+        1,
+        true,
+        "offline");
     Serial.printf("[MQTT] connect elapsed_us=%u\n", (uint32_t)(micros() - mqttConnectStartUs));
     Serial.printf("[MQTT] connect ok=%d state=%d net.connected=%d\n",
                   ok ? 1 : 0, g_mqtt.state(), g_mqttNet.connected() ? 1 : 0);
@@ -2646,6 +3054,26 @@ static inline void cloudLoop(uint32_t) {
         }
         s_mqttJobsSubscribed = anyOk;
       }
+#if !ENABLE_HA_LOCAL_MQTT
+      if (!s_mqttHaCmdSubscribed) {
+        const String haPrefix = cloudTopicHaCmdBase() + "/#";
+        const bool okHaCmd = g_mqtt.subscribe(haPrefix.c_str());
+        Serial.printf("[HA] subscribe cmd ok=%d topic=%s\n",
+                      okHaCmd ? 1 : 0, haPrefix.c_str());
+        s_mqttHaCmdSubscribed = okHaCmd;
+      }
+      if (!s_mqttHaStatusSubscribed) {
+        const String haStatus = homeAssistantStatusTopic();
+        const bool okHaStatus = g_mqtt.subscribe(haStatus.c_str());
+        Serial.printf("[HA] subscribe status ok=%d topic=%s\n",
+                      okHaStatus ? 1 : 0, haStatus.c_str());
+        s_mqttHaStatusSubscribed = okHaStatus;
+      }
+      const bool okAvail = g_mqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+      Serial.printf("[HA] availability online publish ok=%d\n", okAvail ? 1 : 0);
+      g_haDiscoveryDirty = true;
+      (void)publishHomeAssistantDiscovery(true);
+#endif
       if (g_claimDeletePending) {
         Serial.println("[PROV] deleting claim cert/key after device connect");
         spiffsRemoveIfExists(kClaimCertPath);
@@ -2735,12 +3163,116 @@ static inline void cloudLoop(uint32_t) {
     }
     s_mqttJobsSubscribed = anyOk;
   }
+#if !ENABLE_HA_LOCAL_MQTT
+  if (!s_mqttHaCmdSubscribed) {
+    const String haPrefix = cloudTopicHaCmdBase() + "/#";
+    const bool okHaCmd = g_mqtt.subscribe(haPrefix.c_str());
+    Serial.printf("[HA] subscribe cmd ok=%d topic=%s\n",
+                  okHaCmd ? 1 : 0, haPrefix.c_str());
+    s_mqttHaCmdSubscribed = okHaCmd;
+  }
+  if (!s_mqttHaStatusSubscribed) {
+    const String haStatus = homeAssistantStatusTopic();
+    const bool okHaStatus = g_mqtt.subscribe(haStatus.c_str());
+    Serial.printf("[HA] subscribe status ok=%d topic=%s\n",
+                  okHaStatus ? 1 : 0, haStatus.c_str());
+    s_mqttHaStatusSubscribed = okHaStatus;
+  }
+  (void)g_mqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+  (void)publishHomeAssistantDiscovery(false);
+#endif
   g_mqtt.loop();
   const uint32_t nowMs = millis();
   if (g_cloudDirty || (nowMs - g_cloudLastPubMs) >= CLOUD_PUB_INTERVAL_MS) {
     cloudPublishState();
   }
 }
+
+#if ENABLE_HA_LOCAL_MQTT
+static inline void haLocalMqttLoop(uint32_t nowMs) {
+  const String host = String(HA_LOCAL_MQTT_HOST);
+  if (!host.length()) return;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (g_haMqtt.connected()) g_haMqtt.disconnect();
+    g_haMqttSubscribed = false;
+    g_haMqttBackoffMs = 3000;
+    return;
+  }
+
+  g_haMqtt.setServer(host.c_str(), HA_LOCAL_MQTT_PORT);
+  g_haMqtt.setCallback(onMqttMessage);
+
+  if (!g_haMqtt.connected()) {
+    g_haMqttSubscribed = false;
+    if ((uint32_t)(nowMs - g_haMqttLastAttemptMs) < g_haMqttBackoffMs) {
+      return;
+    }
+    g_haMqttLastAttemptMs = nowMs;
+    const String clientId = String("ha-") + getDeviceId6();
+    const String availTopic = cloudTopicHaAvailability();
+    bool ok = false;
+    if (strlen(HA_LOCAL_MQTT_USER) > 0) {
+      ok = g_haMqtt.connect(
+          clientId.c_str(),
+          HA_LOCAL_MQTT_USER,
+          HA_LOCAL_MQTT_PASS,
+          availTopic.c_str(),
+          1,
+          true,
+          "offline");
+    } else {
+      ok = g_haMqtt.connect(
+          clientId.c_str(),
+          availTopic.c_str(),
+          1,
+          true,
+          "offline");
+    }
+    Serial.printf("[HA] local mqtt connect host=%s:%u ok=%d state=%d\n",
+                  host.c_str(),
+                  (unsigned)HA_LOCAL_MQTT_PORT,
+                  ok ? 1 : 0,
+                  g_haMqtt.state());
+    if (!ok) {
+      g_haMqttBackoffMs = min(HA_MQTT_RECONNECT_MAX_MS, g_haMqttBackoffMs * 2);
+      return;
+    }
+    g_haMqttBackoffMs = 3000;
+  }
+
+  if (!g_haMqttSubscribed) {
+    const String haCmd = cloudTopicHaCmdBase() + "/#";
+    const String haStatus = homeAssistantStatusTopic();
+    const bool okCmd = g_haMqtt.subscribe(haCmd.c_str());
+    const bool okStatus = g_haMqtt.subscribe(haStatus.c_str());
+    Serial.printf("[HA] local subscribe cmd=%d status=%d\n",
+                  okCmd ? 1 : 0, okStatus ? 1 : 0);
+    g_haMqttSubscribed = okCmd && okStatus;
+    (void)g_haMqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+    g_haDiscoveryDirty = true;
+    (void)publishHomeAssistantDiscovery(true);
+  }
+
+  const uint32_t pubIntervalMs = CLOUD_PUB_INTERVAL_MS;
+  if (g_cloudDirty || (uint32_t)(nowMs - g_haLastPubMs) >= pubIntervalMs) {
+    const String stateTopic = cloudTopicState();
+    const String state = buildStatusJsonMin();
+    const bool okState = g_haMqtt.publish(stateTopic.c_str(), state.c_str(), true);
+    if (okState) {
+      g_haLastPubMs = nowMs;
+      (void)g_haMqtt.publish(cloudTopicHaAvailability().c_str(), "online", true);
+      (void)publishHomeAssistantDiscovery(false);
+    } else {
+      Serial.printf("[HA] local state publish failed topic=%s state=%d\n",
+                    stateTopic.c_str(),
+                    g_haMqtt.state());
+    }
+  }
+
+  g_haMqtt.loop();
+}
+#endif
 
 #if ENABLE_WAQI
 /* =================== WAQI (World Air Quality Index) =================== */
@@ -14336,6 +14868,10 @@ void loop() {
   maybeRetryStaConnect(now);
   g_loopPhase = "cloud";
   cloudLoop(now);
+#if ENABLE_HA_LOCAL_MQTT
+  g_loopPhase = "ha_local";
+  haLocalMqttLoop(now);
+#endif
   g_loopPhase = "ota_pending";
   handlePendingOtaDecision();
   g_loopPhase = "conn";

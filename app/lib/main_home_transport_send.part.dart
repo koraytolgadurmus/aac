@@ -299,6 +299,7 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
             _captureLastIpForBaseInBackground(api.baseUrl);
             _localDnsFailUntil = null;
             _localUnreachableUntil = null;
+            _localRateLimitedUntil = null;
             _lastLocalOkAt = DateTime.now();
             _markConnected();
           } else {
@@ -313,6 +314,16 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
                 _markLocalDnsFailure();
               } else if (_looksLikeLocalUnreachable(lastErr)) {
                 _markLocalUnreachable();
+              }
+            }
+            final errCode = (api.lastErrCode ?? '').trim().toLowerCase();
+            if (api.lastHttpStatus == 429 || errCode == 'rate_limited') {
+              final until = DateTime.now().add(
+                const Duration(milliseconds: 1200),
+              );
+              if (_localRateLimitedUntil == null ||
+                  until.isAfter(_localRateLimitedUntil!)) {
+                _localRateLimitedUntil = until;
               }
             }
             // If firmware rejects local control because cloud mode is enabled,
@@ -506,6 +517,10 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
       _showSnack(t.t('device_not'));
     }
     final now = DateTime.now();
+    final localRateLimitUntil = _localRateLimitedUntil;
+    if (localRateLimitUntil != null && now.isBefore(localRateLimitUntil)) {
+      await Future.delayed(localRateLimitUntil.difference(now));
+    }
     final key = _canonicalCmdKey(body);
     final isControlPayload =
         body.keys.every(
@@ -548,7 +563,9 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     final lastAt = _lastCmdSendAt;
     if (lastAt != null) {
       final delta = now.difference(lastAt);
-      const minGap = Duration(milliseconds: 250);
+      final minGap = isControlPayload
+          ? const Duration(milliseconds: 450)
+          : const Duration(milliseconds: 250);
       if (delta < minGap) {
         await Future.delayed(minGap - delta);
       }
@@ -782,6 +799,9 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
   Future<String?> _readEndpointId6({
     Duration timeout = const Duration(seconds: 2),
   }) async {
+    final host = Uri.tryParse(api.baseUrl)?.host.trim() ?? '';
+    final onSoftAp = host == '192.168.4.1';
+
     Future<String?> quickRead(String path) async {
       try {
         final uri = Uri.parse('${api.baseUrl}$path');
@@ -805,10 +825,12 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
       _rememberEndpointId6ForCurrentBase(quickStatus);
       return quickStatus;
     }
-    final quickInfo = await quickRead('/info');
-    if (quickInfo != null && quickInfo.isNotEmpty) {
-      _rememberEndpointId6ForCurrentBase(quickInfo);
-      return quickInfo;
+    if (onSoftAp) {
+      final quickInfo = await quickRead('/info');
+      if (quickInfo != null && quickInfo.isNotEmpty) {
+        _rememberEndpointId6ForCurrentBase(quickInfo);
+        return quickInfo;
+      }
     }
 
     try {
@@ -823,17 +845,19 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     } catch (e) {
       debugPrint('[GUARD] read endpoint id from status failed: $e');
     }
-    try {
-      final info = await api.fetchInfoRaw(timeout: timeout);
-      final fromInfo = info == null
-          ? null
-          : _extractEndpointId6FromInfoJson(info);
-      if (fromInfo != null && fromInfo.isNotEmpty) {
-        _rememberEndpointId6ForCurrentBase(fromInfo);
-        return fromInfo;
+    if (onSoftAp) {
+      try {
+        final info = await api.fetchInfoRaw(timeout: timeout);
+        final fromInfo = info == null
+            ? null
+            : _extractEndpointId6FromInfoJson(info);
+        if (fromInfo != null && fromInfo.isNotEmpty) {
+          _rememberEndpointId6ForCurrentBase(fromInfo);
+          return fromInfo;
+        }
+      } catch (e) {
+        debugPrint('[GUARD] read endpoint id from info failed: $e');
       }
-    } catch (e) {
-      debugPrint('[GUARD] read endpoint id from info failed: $e');
     }
     return _recentEndpointId6ForCurrentBase();
   }
@@ -955,10 +979,17 @@ extension _HomeScreenTransportSendPart on _HomeScreenState {
     final ip = await mdns.mdnsResolveHost(fqdn, timeout: timeout);
     if (ip != null) {
       debugPrint('[mDNS] A $fqdn -> $ip');
+      _mdnsNoIpv4LogAtByHost.remove(fqdn.toLowerCase());
       unawaited(_updateActiveDeviceLastIp(ip));
       unawaited(_updateActiveDeviceMdnsHost(host.replaceAll('.local', '')));
     } else {
-      debugPrint('[mDNS] no IPv4 A record for $fqdn');
+      final key = fqdn.toLowerCase();
+      final now = DateTime.now();
+      final last = _mdnsNoIpv4LogAtByHost[key];
+      if (last == null || now.difference(last) >= const Duration(seconds: 30)) {
+        _mdnsNoIpv4LogAtByHost[key] = now;
+        debugPrint('[mDNS] no IPv4 A record for $fqdn');
+      }
     }
     return ip;
   }
