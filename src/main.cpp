@@ -631,6 +631,7 @@ static String g_tlsKeyOwned;
 static const char* g_tlsRootCa = nullptr;
 static const char* g_tlsCert = nullptr;
 static const char* g_tlsKey = nullptr;
+static const size_t PROV_RX_MAX_BYTES = 12288U;
 
 static void applyTlsCommon() {
   // WiFiClientSecure expects seconds (not milliseconds).
@@ -654,6 +655,22 @@ static void ensureMqttPacketBuffer(size_t bytes) {
   Serial.printf("[MQTT] buffer size request=%u ok=%d\n",
                 (unsigned)bytes,
                 ok ? 1 : 0);
+}
+
+static size_t chooseProvisionMqttBufferSize() {
+#if defined(ARDUINO_ARCH_ESP32)
+  const uint32_t freeHeap = (uint32_t)ESP.getFreeHeap();
+  const uint32_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // Provisioning responses can be large, but some field devices operate in a
+  // tighter memory envelope during onboarding. Keep a smaller fallback buffer
+  // so provisioning can still start under moderate pressure.
+  if (freeHeap < 70000U || largest8 < 30000U) return 5120U;
+  if (freeHeap < 90000U || largest8 < 45000U) return 6144U;
+  if (freeHeap < 120000U || largest8 < 70000U) return 8192U;
+  return PROV_RX_MAX_BYTES;
+#else
+  return 6144U;
+#endif
 }
 
 static void recoverMqttTransport(const char* reason, bool requestTlsReload) {
@@ -1103,6 +1120,15 @@ static inline String provCreateAcceptedTopic() {
 static inline String provCreateRejectedTopic() {
   return String("$aws/certificates/create-from-csr/json/rejected");
 }
+static inline String provCreateKeysTopic() {
+  return String("$aws/certificates/create/json");
+}
+static inline String provCreateKeysAcceptedTopic() {
+  return String("$aws/certificates/create/json/accepted");
+}
+static inline String provCreateKeysRejectedTopic() {
+  return String("$aws/certificates/create/json/rejected");
+}
 static inline String provisioningTemplateName() {
   String configured = String(PROVISIONING_TEMPLATE_NAME);
   configured.trim();
@@ -1113,6 +1139,9 @@ static inline String provProvisionTopic() {
   return String("$aws/provisioning-templates/") +
          provisioningTemplateName() + "/provision/json";
 }
+static inline String provProvisionTopicForTemplate(const String& templateName) {
+  return String("$aws/provisioning-templates/") + templateName + "/provision/json";
+}
 static inline String provProvisionAcceptedTopic() {
   return String("$aws/provisioning-templates/") +
          provisioningTemplateName() + "/provision/json/accepted";
@@ -1120,6 +1149,40 @@ static inline String provProvisionAcceptedTopic() {
 static inline String provProvisionRejectedTopic() {
   return String("$aws/provisioning-templates/") +
          provisioningTemplateName() + "/provision/json/rejected";
+}
+static inline String provProvisionAcceptedAnyTopic() {
+  return String("$aws/provisioning-templates/+/provision/json/accepted");
+}
+static inline String provProvisionRejectedAnyTopic() {
+  return String("$aws/provisioning-templates/+/provision/json/rejected");
+}
+static bool isProvisionAcceptedTopic(const String& topic) {
+  return topic.startsWith("$aws/provisioning-templates/") &&
+         topic.endsWith("/provision/json/accepted");
+}
+static bool isProvisionRejectedTopic(const String& topic) {
+  return topic.startsWith("$aws/provisioning-templates/") &&
+         topic.endsWith("/provision/json/rejected");
+}
+static size_t collectProvisionTemplateNames(String* out, size_t cap) {
+  if (out == nullptr || cap == 0) return 0;
+  size_t n = 0;
+  auto pushUnique = [&](const String& name) {
+    String v = name;
+    v.trim();
+    if (!v.length()) return;
+    for (size_t i = 0; i < n; ++i) {
+      if (out[i] == v) return;
+    }
+    if (n < cap) out[n++] = v;
+  };
+  const String product = deviceProductSlug();
+  pushUnique(String(PROVISIONING_TEMPLATE_NAME));
+  pushUnique(product + String("-provisioning-template"));
+  pushUnique(product + String("-dev-fleet-provisioning"));
+  pushUnique(product + String("-prod-fleet-provisioning"));
+  pushUnique(product + String("-staging-fleet-provisioning"));
+  return n;
 }
 
 static int mbedtlsHardwareRng(void* ctx, unsigned char* out, size_t len) {
@@ -1529,6 +1592,7 @@ static void cloudPublishState() {
 
 static bool provisionIfNeeded() {
   ScopedPerfLog perfScope("provision_if_needed");
+  static uint32_t s_lastLowHeapLogMs = 0;
   const String endpoint = effectiveCloudEndpoint();
   if (isPlaceholderCloudEndpoint(endpoint)) {
     Serial.println("[PROV] enter provisionIfNeeded() reason=no_endpoint");
@@ -1563,6 +1627,29 @@ static bool provisionIfNeeded() {
     Serial.println("[PROV] enter provisionIfNeeded() reason=no_wifi");
     return false;
   }
+  const wifi_mode_t wifiMode = WiFi.getMode();
+  const bool apUp = (wifiMode == WIFI_AP || wifiMode == WIFI_AP_STA);
+  if (apUp) {
+    Serial.println("[PROV] enter provisionIfNeeded() reason=ap_active");
+    return false;
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  const uint32_t freeHeap = (uint32_t)ESP.getFreeHeap();
+  const uint32_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // Hard floor: below this, TLS/provisioning attempts are unlikely to succeed.
+  // Keep this conservative, but lower than previous values so cloud onboarding
+  // is not permanently blocked on typical runtime memory levels.
+  if (freeHeap < 36000U || largest8 < 12000U) {
+    const uint32_t nowLogMs = millis();
+    if (s_lastLowHeapLogMs == 0 ||
+        (uint32_t)(nowLogMs - s_lastLowHeapLogMs) >= 5000U) {
+      Serial.printf("[PROV] enter provisionIfNeeded() reason=low_heap free=%u largest8=%u\n",
+                    freeHeap, largest8);
+      s_lastLowHeapLogMs = nowLogMs;
+    }
+    return false;
+  }
+#endif
 
   if (!ensureSpiffsReadyLogged("provision")) {
     Serial.println("[PROV] enter provisionIfNeeded() reason=spiffs_mount_failed");
@@ -1588,7 +1675,11 @@ static bool provisionIfNeeded() {
   if (g_mqttNet.connected()) {
     g_mqttNet.stop();
   }
-  ensureMqttPacketBuffer(8192);
+  const size_t provBuf = chooseProvisionMqttBufferSize();
+  Serial.printf("[PROV] mqtt buffer chosen=%u freeHeap=%u\n",
+                (unsigned)provBuf,
+                (unsigned)ESP.getFreeHeap());
+  ensureMqttPacketBuffer(provBuf);
 
   g_provisioningInProgress = true;
   g_provCertOk = g_provCertFail = g_provThingOk = g_provThingFail = false;
@@ -1663,10 +1754,14 @@ static bool provisionIfNeeded() {
   Serial.printf("[PROV] subscribe ok: %s -> %d\n", provCreateAcceptedTopic().c_str(), subAccepted ? 1 : 0);
   bool subRejected = g_mqtt.subscribe(provCreateRejectedTopic().c_str());
   Serial.printf("[PROV] subscribe ok: %s -> %d\n", provCreateRejectedTopic().c_str(), subRejected ? 1 : 0);
-  bool subProvisionAccept = g_mqtt.subscribe(provProvisionAcceptedTopic().c_str());
-  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provProvisionAcceptedTopic().c_str(), subProvisionAccept ? 1 : 0);
-  bool subProvisionReject = g_mqtt.subscribe(provProvisionRejectedTopic().c_str());
-  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provProvisionRejectedTopic().c_str(), subProvisionReject ? 1 : 0);
+  bool subCreateKeysAccepted = g_mqtt.subscribe(provCreateKeysAcceptedTopic().c_str());
+  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provCreateKeysAcceptedTopic().c_str(), subCreateKeysAccepted ? 1 : 0);
+  bool subCreateKeysRejected = g_mqtt.subscribe(provCreateKeysRejectedTopic().c_str());
+  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provCreateKeysRejectedTopic().c_str(), subCreateKeysRejected ? 1 : 0);
+  bool subProvisionAccept = g_mqtt.subscribe(provProvisionAcceptedAnyTopic().c_str());
+  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provProvisionAcceptedAnyTopic().c_str(), subProvisionAccept ? 1 : 0);
+  bool subProvisionReject = g_mqtt.subscribe(provProvisionRejectedAnyTopic().c_str());
+  Serial.printf("[PROV] subscribe ok: %s -> %d\n", provProvisionRejectedAnyTopic().c_str(), subProvisionReject ? 1 : 0);
 
   Serial.println("[PROV] subscribed to provisioning topics");
   String csrPem;
@@ -1698,11 +1793,15 @@ static bool provisionIfNeeded() {
       if (g_mqtt.connect(clientId.c_str())) {
         const bool subAcceptedRetry = g_mqtt.subscribe(provCreateAcceptedTopic().c_str());
         const bool subRejectedRetry = g_mqtt.subscribe(provCreateRejectedTopic().c_str());
-        const bool subProvisionAcceptRetry = g_mqtt.subscribe(provProvisionAcceptedTopic().c_str());
-        const bool subProvisionRejectRetry = g_mqtt.subscribe(provProvisionRejectedTopic().c_str());
-        Serial.printf("[PROV] retry subscribe createAccepted=%d createRejected=%d provAccepted=%d provRejected=%d\n",
+        const bool subCreateKeysAcceptedRetry = g_mqtt.subscribe(provCreateKeysAcceptedTopic().c_str());
+        const bool subCreateKeysRejectedRetry = g_mqtt.subscribe(provCreateKeysRejectedTopic().c_str());
+        const bool subProvisionAcceptRetry = g_mqtt.subscribe(provProvisionAcceptedAnyTopic().c_str());
+        const bool subProvisionRejectRetry = g_mqtt.subscribe(provProvisionRejectedAnyTopic().c_str());
+        Serial.printf("[PROV] retry subscribe createAccepted=%d createRejected=%d createKeysAccepted=%d createKeysRejected=%d provAccepted=%d provRejected=%d\n",
                       subAcceptedRetry ? 1 : 0,
                       subRejectedRetry ? 1 : 0,
+                      subCreateKeysAcceptedRetry ? 1 : 0,
+                      subCreateKeysRejectedRetry ? 1 : 0,
                       subProvisionAcceptRetry ? 1 : 0,
                       subProvisionRejectRetry ? 1 : 0);
         pubCertCreate = g_mqtt.publish(createTopic.c_str(), createPayload.c_str(), false);
@@ -1716,12 +1815,91 @@ static bool provisionIfNeeded() {
       }
     }
   }
+  auto tryCreateWithAwsGeneratedKey = [&]() -> bool {
+    g_provCertOk = false;
+    g_provCertFail = false;
+    g_provErr = "";
+    g_newCertPem = "";
+    g_newCertId = "";
+    g_certOwnershipToken = "";
+    g_newPrivKey = "";
+    auto ensureProvisionSubscriptions = [&]() {
+      const bool subAcceptedRetry = g_mqtt.subscribe(provCreateAcceptedTopic().c_str());
+      const bool subRejectedRetry = g_mqtt.subscribe(provCreateRejectedTopic().c_str());
+      const bool subCreateKeysAcceptedRetry = g_mqtt.subscribe(provCreateKeysAcceptedTopic().c_str());
+      const bool subCreateKeysRejectedRetry = g_mqtt.subscribe(provCreateKeysRejectedTopic().c_str());
+      const bool subProvisionAcceptRetry = g_mqtt.subscribe(provProvisionAcceptedAnyTopic().c_str());
+      const bool subProvisionRejectRetry = g_mqtt.subscribe(provProvisionRejectedAnyTopic().c_str());
+      Serial.printf("[PROV] fallback subscribe createAccepted=%d createRejected=%d createKeysAccepted=%d createKeysRejected=%d provAccepted=%d provRejected=%d\n",
+                    subAcceptedRetry ? 1 : 0,
+                    subRejectedRetry ? 1 : 0,
+                    subCreateKeysAcceptedRetry ? 1 : 0,
+                    subCreateKeysRejectedRetry ? 1 : 0,
+                    subProvisionAcceptRetry ? 1 : 0,
+                    subProvisionRejectRetry ? 1 : 0);
+    };
+    auto ensureClaimMqttConnected = [&]() -> bool {
+      if (g_mqtt.connected()) return true;
+      Serial.println("[PROV] fallback reconnecting claim MQTT");
+      g_mqttNet.stop();
+      delay(120);
+      if (!g_mqtt.connect(clientId.c_str())) {
+        Serial.printf("[PROV] fallback reconnect failed state=%d\n", g_mqtt.state());
+        return false;
+      }
+      ensureProvisionSubscriptions();
+      return true;
+    };
+
+    const String createKeysTopic = provCreateKeysTopic();
+    if (!ensureClaimMqttConnected()) return false;
+    bool pub = g_mqtt.publish(createKeysTopic.c_str(), "{}", false);
+    if (!pub && !g_mqtt.connected() && ensureClaimMqttConnected()) {
+      pub = g_mqtt.publish(createKeysTopic.c_str(), "{}", false);
+    }
+    Serial.printf("[PROV] fallback publish: %s ok=%d state=%d\n",
+                  createKeysTopic.c_str(),
+                  pub ? 1 : 0,
+                  g_mqtt.state());
+    if (!pub) {
+      return false;
+    }
+  const uint32_t tFallback = millis();
+    while (!g_provCertOk && !g_provCertFail && (millis() - tFallback) < 10000) {
+      if (!g_mqtt.connected()) {
+        Serial.printf("[PROV] fallback wait aborted: mqtt disconnected state=%d\n",
+                      g_mqtt.state());
+        break;
+      }
+      g_mqtt.loop();
+      delay(10);
+    }
+    if (!g_provCertOk) {
+      Serial.printf("[PROV] fallback create/json failed err=%s state=%d\n",
+                    g_provErr.c_str(), g_mqtt.state());
+      return false;
+    }
+    Serial.printf("[PROV] fallback create/json accepted certId=%s keyLen=%u\n",
+                  g_newCertId.c_str(),
+                  (unsigned)g_newPrivKey.length());
+    return true;
+  };
+
   const uint32_t t0 = millis();
   while (!g_provCertOk && !g_provCertFail && (millis() - t0) < 8000) {
+    if (!g_mqtt.connected()) {
+      Serial.printf("[PROV] cert wait aborted: mqtt disconnected state=%d\n",
+                    g_mqtt.state());
+      break;
+    }
     g_mqtt.loop();
     delay(10);
   }
   if (!g_provCertOk) {
+    Serial.println("[PROV] CSR flow did not complete; trying create/json fallback");
+    if (tryCreateWithAwsGeneratedKey()) {
+      // continue provisioning with fallback cert + key
+    } else {
     char errBuf[128] = {0};
     const int tlsErr = g_mqttNet.lastError(errBuf, sizeof(errBuf));
     Serial.printf("[PROV] cert create failed: %s state=%d tlsErr=%d (%s) time=%lu\n",
@@ -1737,6 +1915,7 @@ static bool provisionIfNeeded() {
       g_provFailStreak = 0;
     }
     return false;
+    }
   }
 
   if (g_certOwnershipToken.isEmpty()) {
@@ -1750,20 +1929,43 @@ static bool provisionIfNeeded() {
   String payload =
       String("{\"certificateOwnershipToken\":\"") + g_certOwnershipToken +
       String("\",\"parameters\":{\"SerialNumber\":\"") + getDeviceId6() + "\"}}";
-  bool pubProvision = g_mqtt.publish(provProvisionTopic().c_str(), payload.c_str(), false);
-  Serial.printf("[PROV] publish: %s params={SerialNumber:%s} ok=%d\n",
-                provProvisionTopic().c_str(), getDeviceId6().c_str(), pubProvision ? 1 : 0);
-  if (!pubProvision) {
-    Serial.printf("[PROV] publish failed topic=%s state=%d\n",
-                  provProvisionTopic().c_str(), g_mqtt.state());
+  String templateNames[6];
+  const size_t templateCount = collectProvisionTemplateNames(templateNames, 6);
+  bool provisionOk = false;
+  for (size_t i = 0; i < templateCount; ++i) {
+    g_provThingOk = false;
+    g_provThingFail = false;
+    g_provErr = "";
+    const String provTopic = provProvisionTopicForTemplate(templateNames[i]);
+    bool pubProvision = g_mqtt.publish(provTopic.c_str(), payload.c_str(), false);
+    Serial.printf("[PROV] publish: %s params={SerialNumber:%s} ok=%d\n",
+                  provTopic.c_str(), getDeviceId6().c_str(), pubProvision ? 1 : 0);
+    if (!pubProvision) {
+      Serial.printf("[PROV] publish failed topic=%s state=%d\n",
+                    provTopic.c_str(), g_mqtt.state());
+      continue;
+    }
+    Serial.printf("[PROV] provision request SerialNumber=%s template=%s\n",
+                  getDeviceId6().c_str(), templateNames[i].c_str());
+    const uint32_t t1 = millis();
+    while (!g_provThingOk && !g_provThingFail && (millis() - t1) < 8000) {
+      if (!g_mqtt.connected()) {
+        Serial.printf("[PROV] provision wait aborted: mqtt disconnected state=%d template=%s\n",
+                      g_mqtt.state(),
+                      templateNames[i].c_str());
+        break;
+      }
+      g_mqtt.loop();
+      delay(10);
+    }
+    if (g_provThingOk) {
+      provisionOk = true;
+      break;
+    }
+    Serial.printf("[PROV] template attempt failed template=%s err=%s state=%d\n",
+                  templateNames[i].c_str(), g_provErr.c_str(), g_mqtt.state());
   }
-  Serial.printf("[PROV] provision request SerialNumber=%s\n", getDeviceId6().c_str());
-  const uint32_t t1 = millis();
-  while (!g_provThingOk && !g_provThingFail && (millis() - t1) < 8000) {
-    g_mqtt.loop();
-    delay(10);
-  }
-  if (!g_provThingOk) {
+  if (!provisionOk) {
     char errBuf[128] = {0};
     const int tlsErr = g_mqttNet.lastError(errBuf, sizeof(errBuf));
     Serial.printf("[PROV] provision failed: %s state=%d tlsErr=%d (%s) time=%lu\n",
@@ -1837,7 +2039,13 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
 
   const String t = String(topic ? topic : "");
   if (g_provisioningInProgress) {
-    if (length == 0 || length > 8192) return;
+    if (length == 0 || length > PROV_RX_MAX_BYTES) {
+      Serial.printf("[PROV] drop payload len=%u max=%u topic=%s\n",
+                    (unsigned)length,
+                    (unsigned)PROV_RX_MAX_BYTES,
+                    t.c_str());
+      return;
+    }
     Serial.printf("[PROV] rx topic=%s len=%u\n", t.c_str(), (unsigned)length);
     String body;
     body.reserve(length + 1);
@@ -1847,28 +2055,48 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
       Serial.println("[PROV] JSON parse failed");
       return;
     }
-    if (t == provCreateAcceptedTopic()) {
+    if (t == provCreateAcceptedTopic() || t == provCreateKeysAcceptedTopic()) {
       g_newCertPem = doc["certificatePem"] | "";
       g_newCertId = doc["certificateId"] | "";
       g_certOwnershipToken = doc["certificateOwnershipToken"] | "";
-      Serial.printf("[PROV] create/accepted received: certId=%s tokenLen=%u\n",
+      if (t == provCreateKeysAcceptedTopic()) {
+        const String maybePrivateKey = doc["privateKey"] | "";
+        if (!maybePrivateKey.isEmpty()) {
+          g_newPrivKey = maybePrivateKey;
+        }
+      }
+      Serial.printf("[PROV] create accepted received: topic=%s certId=%s tokenLen=%u keyLen=%u\n",
+                    t.c_str(),
                     g_newCertId.c_str(),
-                    (unsigned)g_certOwnershipToken.length());
+                    (unsigned)g_certOwnershipToken.length(),
+                    (unsigned)g_newPrivKey.length());
       g_provCertOk = !g_newCertPem.isEmpty() && !g_newPrivKey.isEmpty() &&
                      !g_certOwnershipToken.isEmpty();
       return;
     }
-    if (t == provCreateRejectedTopic()) {
+    if (t == provCreateRejectedTopic() || t == provCreateKeysRejectedTopic()) {
       g_provCertFail = true;
-      g_provErr = doc["errorMessage"] | "create_rejected";
+      const String errMsg = doc["errorMessage"] | "";
+      const String errCode = doc["errorCode"] | "";
+      if (!errCode.isEmpty() && !errMsg.isEmpty()) {
+        g_provErr = errCode + String(":") + errMsg;
+      } else if (!errMsg.isEmpty()) {
+        g_provErr = errMsg;
+      } else if (!errCode.isEmpty()) {
+        g_provErr = errCode;
+      } else {
+        g_provErr = "create_rejected";
+      }
       const int previewLen = min(200, (int)body.length());
       String preview = body.substring(0, previewLen);
       if (body.length() > previewLen) preview += "...";
-      Serial.printf("[PROV] create/rejected received: err=%s payload=%s\n",
-                    g_provErr.c_str(), preview.c_str());
+      Serial.printf("[PROV] create rejected received: topic=%s err=%s payload=%s\n",
+                    t.c_str(),
+                    g_provErr.c_str(),
+                    preview.c_str());
       return;
     }
-    if (t == provProvisionAcceptedTopic()) {
+    if (isProvisionAcceptedTopic(t)) {
       g_provThingOk = true;
       const String thingName = doc["thingName"] | "";
       Serial.printf("[PROV] provision/accepted received: thingName=%s certId=%s\n",
@@ -1876,7 +2104,7 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
                     g_newCertId.c_str());
       return;
     }
-    if (t == provProvisionRejectedTopic()) {
+    if (isProvisionRejectedTopic(t)) {
       g_provThingFail = true;
       g_provErr = doc["errorMessage"] | "provision_rejected";
       const int previewLen = min(200, (int)body.length());

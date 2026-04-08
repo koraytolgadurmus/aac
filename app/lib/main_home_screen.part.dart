@@ -29,6 +29,7 @@ class _HomeScreenState extends State<HomeScreen>
   int _connBackoffSeconds = 2;
   DateTime? _lastLocalOkAt;
   DateTime? _lastMdnsFixAt;
+  final Map<String, DateTime> _mdnsBgResolveAtByHost = {};
   DateTime? _localDnsFailUntil;
   DateTime? _localUnreachableUntil;
   DateTime? _lastCloudOkAt;
@@ -156,6 +157,7 @@ class _HomeScreenState extends State<HomeScreen>
   int _activeSwitchRecoverySeq = 0;
   DateTime? _lastActiveDeviceSwitchAt;
   DateTime? _lastEndpointMismatchAt;
+  DateTime? _cloudDisableIntentUntil;
 
   String _literal(String raw) =>
       I18n(Localizations.localeOf(context).languageCode).literal(raw);
@@ -498,15 +500,11 @@ class _HomeScreenState extends State<HomeScreen>
     if (_activeDeviceInCloudList()) return true;
     final membershipKnown = _cloudMembershipKnownForActive();
     final linkedHint = _cloudLinkedHintForActive();
-    // Prefer cloud whenever active device has a strong local linked signal.
-    // This avoids false negatives when `/devices` is empty/stale on mobile
-    // networks while device MQTT is already connected.
-    if (linkedHint) {
-      debugPrint(
-        membershipKnown
-            ? '[CLOUD] eligible via linked hint'
-            : '[CLOUD] eligible via linked hint (membership unknown)',
-      );
+    // Linked-hint can only bypass when membership is still unknown.
+    // If membership is known and active device is not in list, do not send
+    // cloud commands for this device (prevents repeated not_member loops).
+    if (linkedHint && !membershipKnown) {
+      debugPrint('[CLOUD] eligible via linked hint (membership unknown)');
       return true;
     }
     // Last-resort fallback: when cloud membership is temporarily unknown
@@ -571,17 +569,19 @@ class _HomeScreenState extends State<HomeScreen>
 
   bool _cloudStateLooksReady(DeviceState? s) {
     if (s == null) return false;
+    if (s.cloudMqttConnected) return true;
+    final cloudState = s.cloudState.trim().toUpperCase();
+    final mqttState = s.cloudMqttState.trim().toUpperCase();
+    if (cloudState == 'CONNECTED' ||
+        mqttState == 'CONNECTED' ||
+        mqttState == 'READY') {
+      return true;
+    }
     final updatedAtMs = s.cloudStateUpdatedAtMs;
     final freshEnough =
         updatedAtMs > 0 &&
         (DateTime.now().millisecondsSinceEpoch - updatedAtMs) <= 45000;
-    if (!freshEnough) return false;
-    if (s.cloudMqttConnected) return true;
-    final cloudState = s.cloudState.trim().toUpperCase();
-    final mqttState = s.cloudMqttState.trim().toUpperCase();
-    return cloudState == 'CONNECTED' ||
-        mqttState == 'CONNECTED' ||
-        mqttState == 'READY';
+    return freshEnough;
   }
 
   bool _cloudBringupNeeded() {
@@ -1659,6 +1659,16 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _autoEnableCloudLocalFlag({String reason = ''}) async {
     final now = DateTime.now();
+    if (!_cloudLoggedIn()) {
+      debugPrint('[CLOUD] auto-enable skipped (not logged in)');
+      return;
+    }
+    if (!_activeDeviceInCloudList()) {
+      debugPrint(
+        '[CLOUD] auto-enable skipped (active device not in cloud list)',
+      );
+      return;
+    }
     if (_cloudManualDisableUntil != null &&
         now.isBefore(_cloudManualDisableUntil!)) {
       debugPrint(
@@ -1675,6 +1685,17 @@ class _HomeScreenState extends State<HomeScreen>
     } catch (_) {}
     if (mounted) setState(() {});
     debugPrint('[CLOUD] auto-enabled due to device policy reason=$reason');
+  }
+
+  void _armCloudDisableIntent({Duration ttl = const Duration(seconds: 30)}) {
+    _cloudDisableIntentUntil = DateTime.now().add(ttl);
+  }
+
+  bool _consumeCloudDisableIntent() {
+    final until = _cloudDisableIntentUntil;
+    if (until == null) return false;
+    _cloudDisableIntentUntil = null;
+    return DateTime.now().isBefore(until);
   }
 
   Future<void> _cmdSendQueue = Future<void>.value();

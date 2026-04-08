@@ -137,11 +137,29 @@ extension _HomeScreenCloudAuthTransportPart on _HomeScreenState {
       final hasExact = _devices.any((d) => d.id == _activeDeviceId);
       final hasCanonical = _findDeviceByCanonical(_activeDeviceId!) != null;
       if (!hasExact && !hasCanonical) {
-        debugPrint(
-          '[DEVICES] active device no longer exists -> clearing active id ($_activeDeviceId)',
-        );
-        _activeDeviceId = null;
-        changed = true;
+        final stale = _activeDeviceId!.trim();
+        final staleCanonical = canonicalizeDeviceId(stale);
+        if (staleCanonical != null && staleCanonical.isNotEmpty) {
+          final rebuilt = _SavedDevice(
+            id: staleCanonical,
+            brand: _preferredBrandForDeviceHint(staleCanonical),
+            baseUrl: api.baseUrl,
+            thingName: thingNameFromAny(staleCanonical),
+            mdnsHost: mdnsHostFromAny(staleCanonical),
+          );
+          _devices.add(rebuilt);
+          _activeDeviceId = rebuilt.id;
+          changed = true;
+          debugPrint(
+            '[DEVICES] active device missing after cloud sync; rebuilt local entry id=${rebuilt.id}',
+          );
+        } else {
+          debugPrint(
+            '[DEVICES] active device no longer exists -> clearing active id ($_activeDeviceId)',
+          );
+          _activeDeviceId = null;
+          changed = true;
+        }
       }
     }
 

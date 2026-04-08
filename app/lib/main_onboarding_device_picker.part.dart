@@ -195,7 +195,7 @@ extension _HomeScreenOnboardingDevicePicker on _HomeScreenState {
       }
       final localCloudCmdOk = await _send({
         'cloud': cloudPayload,
-      }, forceLocalOnly: true);
+      }, forceLocalOnly: false);
       if (!localCloudCmdOk) {
         await _recoverCloudEnableForActiveDevice();
         final cloudReady = await _ensureCloudReadyForActiveDevice(
@@ -979,6 +979,47 @@ extension _HomeScreenOnboardingDevicePicker on _HomeScreenState {
         final id6 = normalizeDeviceId6(dev.id);
         if (id6 == null || id6.isEmpty) {
           _showSnack('Cloud cihaz kimliği bulunamadı');
+          return;
+        }
+        if (!mounted) return;
+        var verifyInput = '';
+        final verifyOk =
+            await showDialog<bool>(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: Text(t.literal('Cloud’dan da kaldır')),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Cloud kaldırma için cihaz kodunu yazın: $id6'),
+                    const SizedBox(height: 10),
+                    TextField(
+                      onChanged: (v) => verifyInput = v.trim(),
+                      decoration: const InputDecoration(
+                        hintText: 'Örn: 693133',
+                      ),
+                    ),
+                  ],
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(ctx).pop(false),
+                    child: Text(t.literal('Vazgeç')),
+                  ),
+                  FilledButton(
+                    onPressed: () {
+                      final okTyped = verifyInput == id6;
+                      Navigator.of(ctx).pop(okTyped);
+                    },
+                    child: Text(t.literal('Doğrula')),
+                  ),
+                ],
+              ),
+            ) ??
+            false;
+        if (!verifyOk) {
+          _showSnack('Kod doğrulanmadı, cloud kaldırma iptal.');
           return;
         }
         await _cloudRefreshIfNeeded();
